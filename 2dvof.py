@@ -1,6 +1,7 @@
 import taichi as ti
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 ti.init(arch=ti.x64, default_fp=ti.f64)
 
@@ -206,6 +207,7 @@ nstep = 100
 R_limit = 15.0
 count = -1
 check_mass = np.zeros((int(istep_max / nstep), 1))  # 检查质量
+os.makedirs('output', exist_ok=True) # Make dir for output
 while istep < istep_max:
     # set boundary conditions
     set_BC()
@@ -237,4 +239,4 @@ while istep < istep_max:
 
         X, Y = np.meshgrid(xm1[imin:imax + 1], ym1[jmin:jmax + 1])
         plt.contour(xm1[imin:imax + 1], ym1[jmin:jmax + 1], Fn1[imin:imax + 1, jmin:jmax + 1].T, [0.5], cmap=plt.cm.jet)
-        plt.savefig(str(istep) + '.png')
+        plt.savefig(f'output/{istep:05d}.png')
