@@ -210,8 +210,6 @@ check_mass = np.zeros(istep_max // nstep)  # Check mass
 os.makedirs('output', exist_ok=True)  # Make dir for output
 
 while istep < istep_max:
-    # set boundary conditions
-    set_BC()
     istep += 1  # time step +1    
     # Update rho, mu by F
     cal_mu_rho()
@@ -225,8 +223,7 @@ while istep < istep_max:
     isSuccess = solver.info()
     update()
     solve_F()
-    set_BC()
-    istep += 1  # time step +1, notice this is the second time += 1
+    set_BC()  # set boundary conditions
     if (istep % nstep) == 0:  # Output data every 100 steps
         Fnp = F.to_numpy()
         count = istep // nstep - 1
