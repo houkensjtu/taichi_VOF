@@ -5,6 +5,9 @@ import os
 
 ti.init(arch=ti.cpu, default_fp=ti.f64)
 
+SAVE_FIG = True
+SAVE_DAT = True
+
 nx = 32  # Number of grid points in the x direction
 ny = 32  # Number of grid points in the y direction
 res = 32
@@ -229,9 +232,12 @@ while istep < istep_max:
         count = istep // nstep - 1
         check_mass[count] = np.sum(abs(Fnp[imin:-1, jmin:-1]))
         print(f'>>> Number of iterations:{istep:<5d}, sum of VOF:{check_mass[count]:6.2f}')
-        xm1 = xm.to_numpy()
-        ym1 = ym.to_numpy()
-        plt.figure(figsize=(5, 5))  # Initialize the output image        
-        plt.contour(xm1[imin:], ym1[jmin:], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
-        plt.savefig(f'output/{istep:05d}.png')
-        plt.close()
+        if SAVE_FIG:
+            xm1 = xm.to_numpy()
+            ym1 = ym.to_numpy()
+            plt.figure(figsize=(5, 5))  # Initialize the output image        
+            plt.contour(xm1[imin:], ym1[jmin:], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
+            plt.savefig(f'output/{istep:05d}.png')
+            plt.close()
+        if SAVE_DAT:
+            np.savetxt(f'output/{istep:05d}-F.csv', Fnp, delimiter=',')
