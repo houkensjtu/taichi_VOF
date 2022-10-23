@@ -37,13 +37,11 @@ jmax = jmin + ny - 1
 
 F = ti.field(float, shape=(imax + 2, jmax + 2))
 Fn = ti.field(float, shape=(imax + 2, jmax + 2))
-
 u = ti.field(float, shape=(imax + 2, jmax + 2))
 v = ti.field(float, shape=(imax + 2, jmax + 2))
 p = ti.field(float, shape=(imax + 1, jmax + 1))
 rho = ti.field(float, shape=(imax + 2, jmax + 2))
 mu = ti.field(float, shape=(imax + 2, jmax + 2))
-
 x = ti.field(float, shape=imax + 2)
 y = ti.field(float, shape=imax + 2)
 xm = ti.field(float, shape=imax + 1)
@@ -54,7 +52,6 @@ dx = x[imin + 1] - x[imin]
 dy = y[jmin + 1] - y[jmin]
 dxi = 1 / dx
 dyi = 1 / dy
-
 N = nx * ny
 L = ti.linalg.SparseMatrixBuilder(N, N, max_num_triplets=N * 6)
 
@@ -202,26 +199,22 @@ def solve_F():
 grid_staggered()
 # Set initial volume fraction
 set_init_F()
-
 # Create Laplace operator
 Laplace_operator(L)
 A = L.build()
 
 istep = 0
 istep_max = 50000
-
 nstep = 100
-R_limit = 15.0
-count = -1
-check_mass = np.zeros((int(istep_max / nstep), 1))  # Check mass
+check_mass = np.zeros(istep_max // nstep)  # Check mass
 os.makedirs('output', exist_ok=True)  # Make dir for output
+
 while istep < istep_max:
     # set boundary conditions
     set_BC()
-    istep = istep + 1
+    istep += 1  # time step +1    
     # Update rho, mu by F
     cal_mu_rho()
-
     # Solving Pressure Poisson Equation Using Projection Method
     M_Possion()
     solver = ti.linalg.SparseSolver(solver_type="LU")
@@ -233,21 +226,15 @@ while istep < istep_max:
     update()
     solve_F()
     set_BC()
-    istep = istep + 1  # time step +1
-    if np.mod(istep, nstep) == 0:  # Output data every 100 steps
-        count = count + 1
-        Fn1 = F.to_numpy()
-
-        check_mass[count] = sum(sum(abs(Fn1[imin:imax + 1, jmin:jmax + 1])))
-        print('Number of iterations', str(istep), '\n check mass：',
-              str(check_mass[count]), '\n')
-        plt.figure(figsize=(5, 5))
+    istep += 1  # time step +1, notice this is the second time += 1
+    if (istep % nstep) == 0:  # Output data every 100 steps
+        Fnp = F.to_numpy()
+        count = istep // nstep - 1
+        check_mass[count] = np.sum(abs(Fnp[imin:-1, jmin:-1]))
+        print(f'>>> Number of iterations:{istep:<5d}, sum of VOF:{check_mass[count]:6.2f}')
         xm1 = xm.to_numpy()
         ym1 = ym.to_numpy()
-
-        X, Y = np.meshgrid(xm1[imin:imax + 1], ym1[jmin:jmax + 1])
-        plt.contour(xm1[imin:imax + 1],
-                    ym1[jmin:jmax + 1],
-                    Fn1[imin:imax + 1, jmin:jmax + 1].T, [0.5],
-                    cmap=plt.cm.jet)
+        plt.figure(figsize=(5, 5))  # Initialize the output image        
+        plt.contour(xm1[imin:], ym1[jmin:], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
         plt.savefig(f'output/{istep:05d}.png')
+        plt.close()
