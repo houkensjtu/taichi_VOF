@@ -113,7 +113,7 @@ def set_BC():
     for i in ti.ndrange(imax + 2):
         # bottom
         u[i, jmin - 1] = u[i, jmin]
-        v[i, jmin - 1] = v[i, jmin]
+        # v[i, jmin - 1] = v[i, jmin] # v[i, 0] = v[i, 1] both not touched in advect ?
         F[i, jmin - 1] = F[i, jmin]
         # top
         u[i, jmax + 1] = u[i, jmax]
@@ -121,7 +121,7 @@ def set_BC():
         F[i, jmax + 1] = F[i, jmax]
     for j in ti.ndrange(jmax + 2):
         # left
-        u[imin - 1, j] = u[imin, j]
+        # u[imin - 1, j] = u[imin, j]  # u[0, j] = u[1, j] both not touched in advect ?
         v[imin - 1, j] = v[imin, j]
         F[imin - 1, j] = F[imin, j]
         # right
@@ -140,7 +140,7 @@ def var(a, b, c):
 @ti.kernel
 def cal_mu_rho():
     # Calculate density rho and kinematic viscosity Mu
-    for j, i in ti.ndrange((jmin - 1, jmax + 2), (imin - 1, imax + 2)):
+    for j, i in ti.ndrange(jmax + 2, imax + 2):
         rho[i, j] = rho_air * (1 - var(0, 1, F[i, j])) + rho_water * var(
             0, 1, F[i, j])
         mu[i, j] = (nu_water * rho_water * var(0, 1, F[i, j]) + nu_air * rho_air * rho_air * (1 - var(0, 1, F[i, j]))) / \
@@ -148,9 +148,9 @@ def cal_mu_rho():
 
 
 @ti.kernel
-def M_Possion():
+def advect():
     # Solving Pressure Poisson Equation Using Projection Method
-    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)): # i = 2:32; j = 1:32
         v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
         u_star[i, j] = (
             u[i, j] + dt *
@@ -159,7 +159,7 @@ def M_Possion():
              (u[i, j - 1] - 2 * u[i, j] + u[i, j + 1]) * dyi**2 - u[i, j] *
              (u[i + 1, j] - u[i - 1, j]) * 0.5 * dxi - v_here *
              (u[i, j + 1] - u[i, j - 1]) * 0.5 * dyi + gx))
-    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
+    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)): # i = 1:32; j = 2:32
         u_here = 0.25 * (u[i, j - 1] + u[i, j] + u[i + 1, j - 1] + u[i + 1, j])
         v_star[i, j] = (
             v[i, j] + dt *
@@ -168,6 +168,10 @@ def M_Possion():
              (v[i, j - 1] - 2 * v[i, j] + v[i, j + 1]) * dyi**2 - u_here *
              (v[i + 1, j] - v[i - 1, j]) * 0.5 * dxi - v[i, j] *
              (v[i, j + 1] - v[i, j - 1]) * 0.5 * dyi + gy))
+
+
+@ti.kernel
+def cal_div():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
         R[i - imin + (j - 1) *
           (imax + 1 - imin)] = (-rho[i, j] / dt *
@@ -176,7 +180,7 @@ def M_Possion():
 
 
 @ti.kernel
-def update():
+def update_puv():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
         p[i, j] = pv[i - imin + (j - 1) * (imax + 1 - imin)]
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
@@ -217,14 +221,15 @@ while istep < istep_max:
     # Update rho, mu by F
     cal_mu_rho()
     # Solving Pressure Poisson Equation Using Projection Method
-    M_Possion()
+    advect()
+    cal_div()
     solver = ti.linalg.SparseSolver(solver_type="LU")
     solver.analyze_pattern(A)
     solver.factorize(A)
-    pv_init = solver.solve(R)
-    pv.from_numpy(pv_init)
+    pv_np = solver.solve(R)
+    pv.from_numpy(pv_np)
     isSuccess = solver.info()
-    update()
+    update_puv()
     solve_F()
     set_BC()  # set boundary conditions
     if (istep % nstep) == 0:  # Output data every 100 steps
