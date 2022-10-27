@@ -190,7 +190,7 @@ def update_puv():
 
 
 @ti.kernel
-def solve_F():
+def solve_F():  # Method used by ZCL
     for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
         u_loc = 3 / 8 * (u[i, j] + u[i + 1, j]) + 1 / 16 * \
                 (u[i, j + 1] + u[i + 1, j + 1] + u[i, j - 1] + u[i + 1, j - 1])
@@ -201,6 +201,51 @@ def solve_F():
                     (F[i, j + 1] - F[i, j - 1]) * dyi / 2))
         F[i, j] = var(0, 1, F[i, j])
 
+
+@ti.kernel
+def solve_VOF():  # Method described in original VOF paper
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        f_a, f_d = 0.0, 0.0
+        # Flux left
+        if u[i, j] > 0:
+            f_d, f_a = F[i-1, j], F[i, j]
+        else:
+            f_a, f_d = F[i-1, j], F[i, j]
+        V = u[i, j] * dt
+        CF = max((1.0 - f_a) * abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_l = min(f_a * abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (abs(u[i,j]) + 1e-12)
+        
+        # Flux right
+        if u[i+1, j] > 0:
+            f_d, f_a = F[i, j], F[i+1, j]
+        else:
+            f_a, f_d = F[i, j], F[i+1, j]
+        V = u[i+1, j] * dt
+        CF = max((1.0 - f_a) * abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_r = min(f_a * abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (abs(u[i+1, j]) + 1e-12)
+        
+        # Flux top
+        if v[i, j + 1] > 0:
+            f_d, f_a = F[i, j], F[i, j + 1]
+        else:
+            f_a, f_d = F[i, j], F[i, j + 1]
+        V = v[i, j + 1] * dt
+        CF = max((1.0 - f_a) * abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_t = min(f_a * abs(V) / dx + CF / dx, f_d) * (v[i,j+1]) / (abs(v[i, j+1]) + 1e-12)
+        
+        # Flux bottom
+        if v[i, j] > 0:
+            f_d, f_a = F[i, j-1], F[i, j]
+        else:
+            f_a, f_d = F[i, j-1], F[i, j]
+        V = v[i, j] * dt
+        CF = max((1.0 - f_a) * abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_b = min(f_a * abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (abs(v[i,j]) + 1e-12)
+        
+        F[i, j] += (flux_l - flux_r - flux_t + flux_b)
+        F[i, j] = var(0, 1, F[i, j])
+        # print(f'F[{i}, {j}] = {F[i,j]}, {flux_l}, {flux_r}, {flux_t}, {flux_b}')
+        
 
 # Calculate the coordinates of the staggered point
 grid_staggered()
@@ -230,7 +275,8 @@ while istep < istep_max:
     pv.from_numpy(pv_np)
     isSuccess = solver.info()
     update_puv()
-    solve_F()
+    # solve_F()
+    solve_VOF()    
     set_BC()  # set boundary conditions
     if (istep % nstep) == 0:  # Output data every 100 steps
         Fnp = F.to_numpy()
