@@ -183,10 +183,12 @@ def cal_div():
 
 @ti.kernel
 def cal_fgrad():
+    ti.loop_config(serialize=True)
     for i, j in Fgrad:
         dfdx = 0.5 * (F[i + 1, j] - F[i - 1, j]) / dx
         dfdy = 0.5 * (F[i, j + 1] - F[i, j - 1]) / dy
         Fgrad[i, j] = ti.Vector([dfdx, dfdy])
+        # print(i,j,Fgrad[i,j])
 
 
 @ti.kernel
@@ -195,8 +197,10 @@ def update_puv():
         p[i, j] = pv[i - imin + (j - 1) * (imax + 1 - imin)]
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
+        assert u[i, j] * dt < 0.25 * dx, 'U velocity courant number > 1'
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
         v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
+        assert v[i, j] * dt < 0.25 * dy, 'V velocity courant number > 1'
 
 
 @ti.kernel
@@ -214,15 +218,19 @@ def solve_F():  # Method used by ZCL
 
 @ti.kernel
 def solve_VOF():  # Method described in original VOF paper
+    eps = 1e-6
+    ti.loop_config(serialize=True)
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        f_a, f_d, f_ad = 0.0, 0.0, 0.0
+        f_a, f_d, f_ad, f_up = 0.0, 0.0, 0.0, 0.0
         # Flux left
         if u[i, j] > 0:
-            f_d, f_a = F[i-1, j], F[i, j]
+            f_d, f_a, f_up = F[i-1, j], F[i, j], F[i-2, j]
         else:
-            f_a, f_d = F[i-1, j], F[i, j]
-        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_d
+            f_a, f_d, f_up = F[i-1, j], F[i, j], F[i+1, j]
+        if abs(Fgrad[i, j][0]) > 2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_ad = f_a
+        elif f_a < eps or f_up < eps:
+            f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = u[i, j] * dt
@@ -231,24 +239,30 @@ def solve_VOF():  # Method described in original VOF paper
         
         # Flux right
         if u[i+1, j] > 0:
-            f_d, f_a = F[i, j], F[i+1, j]
+            f_d, f_a, f_up = F[i, j], F[i+1, j], F[i-1, j]
         else:
-            f_a, f_d = F[i, j], F[i+1, j]
-        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_d
+            f_a, f_d, f_up = F[i, j], F[i+1, j], F[i+2, j]
+        if abs(Fgrad[i, j][0]) >  2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_ad = f_a
+        elif f_a < eps or f_up < eps:
+            f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = u[i+1, j] * dt
         CF = max((1.0 - f_ad) * abs(V) - (1.0 - f_d) * dx, 0.0)
         flux_r = min(f_ad * abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (abs(u[i+1, j]) + 1e-12)
+        if i == imax:
+            flux_r = 0.0
         
         # Flux top
         if v[i, j + 1] > 0:
-            f_d, f_a = F[i, j], F[i, j + 1]
+            f_d, f_a, f_up = F[i, j], F[i, j + 1], F[i, j-1]
         else:
-            f_a, f_d = F[i, j], F[i, j + 1]
-        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_d
+            f_a, f_d, f_up = F[i, j], F[i, j + 1], F[i, j+2]
+        if abs(Fgrad[i, j][0]) > 2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_ad = f_a
+        elif f_a < eps or f_up < eps:
+            f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = v[i, j + 1] * dt
@@ -257,11 +271,13 @@ def solve_VOF():  # Method described in original VOF paper
         
         # Flux bottom
         if v[i, j] > 0:
-            f_d, f_a = F[i, j-1], F[i, j]
+            f_d, f_a, f_up = F[i, j-1], F[i, j], F[i, j-2]
         else:
-            f_a, f_d = F[i, j-1], F[i, j]
-        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_d
+            f_a, f_d, f_up = F[i, j-1], F[i, j], F[i, j+1]
+        if abs(Fgrad[i, j][0]) > 2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_ad = f_a
+        elif f_a < eps or f_up < eps:
+            f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = v[i, j] * dt
