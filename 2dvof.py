@@ -47,14 +47,16 @@ v = ti.field(float, shape=(imax + 2, jmax + 2))
 p = ti.field(float, shape=(imax + 1, jmax + 1))
 rho = ti.field(float, shape=(imax + 2, jmax + 2))
 mu = ti.field(float, shape=(imax + 2, jmax + 2))
-x = ti.field(float, shape=imax + 2)
-y = ti.field(float, shape=imax + 2)
-xm = ti.field(float, shape=imax + 1)
-ym = ti.field(float, shape=imax + 1)
-x.from_numpy(np.hstack((0, np.linspace(0, Lx, nx + 1))))
-y.from_numpy(np.hstack((0, np.linspace(0, Ly, ny + 1))))
-dx = x[imin + 1] - x[imin]
-dy = y[jmin + 1] - y[jmin]
+
+x = ti.field(float, shape=imax + 3)
+y = ti.field(float, shape=jmax + 3)
+x.from_numpy(np.hstack((0.0, np.linspace(0, Lx, nx + 1), Lx)))  # [0, 0, ... 1, 1]
+y.from_numpy(np.hstack((0.0, np.linspace(0, Ly, ny + 1), Ly)))  # [0, 0, ... 1, 1]
+xm = ti.field(float, shape=imax + 2)
+ym = ti.field(float, shape=jmax + 2)
+
+dx = x[imin + 2] - x[imin + 1]
+dy = y[jmin + 2] - y[jmin + 1]
 dxi = 1 / dx
 dyi = 1 / dy
 N = nx * ny
@@ -68,17 +70,21 @@ pv = ti.field(float, shape=((imax - imin + 1) * (imax - imin + 1)))
 
 
 @ti.kernel
-def grid_staggered():
-    for i in ti.ndrange((imin, imax + 1)):  # [1, 32]
+def grid_staggered():  # 11/3 Checked
+    '''
+    Calculate the center position of cells.
+    xm is imax + 1 size xm[0], xm[1], xm[2] ... xm[32]
+    Here the calculation is from xm[1] to xm[32]
+    '''
+    for i in xm:  # xm[0] = 0.0, xm[33] = 1.0
         xm[i] = 0.5 * (x[i] + x[i + 1])
-    for j in ti.ndrange((jmin, jmax + 1)):  # [1, 32]
+    for j in ym:
         ym[j] = 0.5 * (y[j] + y[j + 1])
-
-
+        
 @ti.kernel
-def set_init_F():
+def set_init_F():  # 11/3 Checked
     # Sets the initial volume fraction
-    for i, j in ti.ndrange(imax + 1, jmax + 1):  # [0,32], [0,32]
+    for i, j in F:  # [0,33], [0,33]
         if (xm[i] >= x1) and (xm[i] <= x2) and (ym[j] >= y1) and (ym[j] <= y2):
             F[i, j] = 1.0
 
@@ -140,13 +146,12 @@ def var(a, b, c):
 
 
 @ti.kernel
-def cal_mu_rho():
+def cal_mu_rho():  # 11/3 Checked + Modified
     # Calculate density rho and kinematic viscosity Mu
-    for j, i in ti.ndrange(jmax + 2, imax + 2):
-        rho[i, j] = rho_air * (1 - var(0, 1, F[i, j])) + rho_water * var(
-            0, 1, F[i, j])
-        mu[i, j] = (nu_water * rho_water * var(0, 1, F[i, j]) + nu_air * rho_air * rho_air * (1 - var(0, 1, F[i, j]))) / \
-                   rho[i, j]
+    for I in ti.grouped(rho):
+        F = var(0.0, 1.0, F[I])
+        rho[I] = rho_air * (1 - F) + rho_water * F
+        mu[I] = (nu_water * rho_water + nu_air * rho_air) / rho[I]
 
 
 @ti.kernel
@@ -182,13 +187,15 @@ def cal_div():
 
 
 @ti.kernel
-def cal_fgrad():
-    ti.loop_config(serialize=True)
-    for i, j in Fgrad:
+def cal_fgrad():  # 11/3 Checked, no out-of-range
+    '''
+    Calculate the Fgrad in internal area.
+    Fgrad on the edge (Fgrad[0:] etc.) is not defined.
+    '''
+    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
         dfdx = 0.5 * (F[i + 1, j] - F[i - 1, j]) / dx
         dfdy = 0.5 * (F[i, j + 1] - F[i, j - 1]) / dy
         Fgrad[i, j] = ti.Vector([dfdx, dfdy])
-        # print(i,j,Fgrad[i,j])
 
 
 @ti.kernel
@@ -329,7 +336,7 @@ while istep < istep_max:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
             plt.figure(figsize=(5, 5))  # Initialize the output image        
-            plt.contour(xm1[imin:], ym1[jmin:], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
+            plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
             # plt.contourf(xm1[imin:], ym1[jmin:], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}.png')
             plt.close()
