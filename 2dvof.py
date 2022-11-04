@@ -151,7 +151,8 @@ def cal_mu_rho():  # 11/3 Checked + Modified
     for I in ti.grouped(rho):
         F = var(0.0, 1.0, F[I])
         rho[I] = rho_air * (1 - F) + rho_water * F
-        mu[I] = (nu_water * rho_water + nu_air * rho_air) / rho[I]
+        # mu[I] = (nu_water * rho_water + nu_air * rho_air) / rho[I] 
+        mu[I] = nu_water * F + nu_air * (1.0 - F)
 
 
 @ti.kernel
@@ -337,7 +338,7 @@ while istep < istep_max:
             ym1 = ym.to_numpy()
             plt.figure(figsize=(5, 5))  # Initialize the output image        
             plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
-            # plt.contourf(xm1[imin:], ym1[jmin:], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
+            # plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}.png')
             plt.close()
         if SAVE_DAT:
