@@ -49,7 +49,7 @@ Fgrad = ti.Vector.field(2, float, shape=(imax + 2, jmax + 2))
 
 u = ti.field(float, shape=(imax + 2, jmax + 2))
 v = ti.field(float, shape=(imax + 2, jmax + 2))
-p = ti.field(float, shape=(imax + 1, jmax + 1))
+p = ti.field(float, shape=(imax + 2, jmax + 2))
 rho = ti.field(float, shape=(imax + 2, jmax + 2))
 mu = ti.field(float, shape=(imax + 2, jmax + 2))
 
@@ -189,8 +189,8 @@ def advect():
 @ti.kernel
 def cal_div():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
-        R[i - imin + (j - 1) *
-          (imax + 1 - imin)] = (-rho[i, j] / dt *
+        linear_id = (i - imin) + (j - jmin) * (imax + 1 - imin)
+        R[linear_id] = (-rho[i, j] / dt *
                                 ((u_star[i + 1, j] - u_star[i, j]) * dxi +
                                  (v_star[i, j + 1] - v_star[i, j]) * dyi))
 
@@ -218,7 +218,8 @@ def update_puv():
     # TODO: Why u[i,j] * dt explodes when > 64x64 grid ?
     # Seems because pressure calculation explodes
     for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
-        p[i, j] = pv[i - imin + (j - 1) * (imax + 1 - imin)]
+        linear_id = (i - imin) + (j - 1) * (imax + 1 - imin)
+        p[i, j] = pv[linear_id]
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
         assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1'
