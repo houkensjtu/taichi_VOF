@@ -2,8 +2,13 @@ import taichi as ti
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-
-ti.init(arch=ti.cpu, default_fp=ti.f64)
+'''
+Donor-acceptor scheme now basically works
+but simulation is still unstable once density modified
+also unstable when resolution increased to > 64 x 64
+Seems reason is in update_puv; misterious divergence happened.
+'''
+ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
 SAVE_DAT = True
@@ -80,6 +85,7 @@ def grid_staggered():  # 11/3 Checked
         xm[i] = 0.5 * (x[i] + x[i + 1])
     for j in ym:
         ym[j] = 0.5 * (y[j] + y[j + 1])
+
         
 @ti.kernel
 def set_init_F():  # 11/3 Checked
@@ -91,6 +97,7 @@ def set_init_F():  # 11/3 Checked
 
 @ti.kernel
 def Laplace_operator(A: ti.types.sparse_matrix_builder()):
+    # TODO: Check Is the coefficients of matrix A wrong?
     for i, j in ti.ndrange(res, res):
         row = i * res + j
         if row != 0:
@@ -157,6 +164,7 @@ def cal_mu_rho():  # 11/3 Checked + Modified
 
 @ti.kernel
 def advect():
+    # TODO: Is this scheme better, or the original MAC scheme better?
     # Solving Pressure Poisson Equation Using Projection Method
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)): # i = 2:32; j = 1:32
         v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
@@ -187,28 +195,36 @@ def cal_div():
                                  (v_star[i, j + 1] - v_star[i, j]) * dyi))
 
 
-@ti.kernel
+# @ti.kernel
 def cal_fgrad():  # 11/3 Checked, no out-of-range
     '''
     Calculate the Fgrad in internal area.
-    Fgrad on the edge (Fgrad[0:] etc.) is not defined.
+
     '''
-    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
-        dfdx = 0.5 * (F[i + 1, j] - F[i - 1, j]) / dx
-        dfdy = 0.5 * (F[i, j + 1] - F[i, j - 1]) / dy
-        Fgrad[i, j] = ti.Vector([dfdx, dfdy])
+    #for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+    #    dfdx = 0.5 * (F[i + 1, j] - F[i - 1, j]) / dx
+    #    dfdy = 0.5 * (F[i, j + 1] - F[i, j - 1]) / dy
+    #    Fgrad[i, j] = ti.Vector([dfdx, dfdy])
+    Fnp = F.to_numpy()
+    Fgrad_np = np.gradient(Fnp)
+    # Fgrad.from_numpy(Fgrad_np)
+    # Now Fgrad is not calculated (all 0); lead to a f_ad = f_d scheme for most cells.
 
 
 @ti.kernel
 def update_puv():
+    # TODO: Check the pressure correction equation.
+    # Pressure at the surface should be specified.
+    # TODO: Why u[i,j] * dt explodes when > 64x64 grid ?
+    # Seems because pressure calculation explodes
     for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
         p[i, j] = pv[i - imin + (j - 1) * (imax + 1 - imin)]
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
-        assert u[i, j] * dt < 0.25 * dx, 'U velocity courant number > 1'
+        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1'
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
         v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
-        assert v[i, j] * dt < 0.25 * dy, 'V velocity courant number > 1'
+        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1'
 
 
 @ti.kernel
@@ -225,17 +241,19 @@ def solve_F():  # Method used by ZCL
 
 
 @ti.kernel
-def solve_VOF():  # Method described in original VOF paper
+def solve_VOF():
+    # TODO: Simplify the code
+    # Method described in original VOF paper
     eps = 1e-6
     ti.loop_config(serialize=True)
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
         f_a, f_d, f_ad, f_up = 0.0, 0.0, 0.0, 0.0
         # Flux left
         if u[i, j] > 0:
-            f_d, f_a, f_up = F[i-1, j], F[i, j], F[i-2, j]
+            f_d, f_a, f_up = F[i-1, j], F[i, j], F[ max(0,i-2) , j]
         else:
             f_a, f_d, f_up = F[i-1, j], F[i, j], F[i+1, j]
-        if abs(Fgrad[i, j][0]) > 2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
@@ -249,8 +267,8 @@ def solve_VOF():  # Method described in original VOF paper
         if u[i+1, j] > 0:
             f_d, f_a, f_up = F[i, j], F[i+1, j], F[i-1, j]
         else:
-            f_a, f_d, f_up = F[i, j], F[i+1, j], F[i+2, j]
-        if abs(Fgrad[i, j][0]) >  2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_a, f_d, f_up = F[i, j], F[i+1, j], F[ min(i+2, imax+1) , j]
+        if abs(Fgrad[i, j][0]) >  abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
@@ -266,8 +284,8 @@ def solve_VOF():  # Method described in original VOF paper
         if v[i, j + 1] > 0:
             f_d, f_a, f_up = F[i, j], F[i, j + 1], F[i, j-1]
         else:
-            f_a, f_d, f_up = F[i, j], F[i, j + 1], F[i, j+2]
-        if abs(Fgrad[i, j][0]) > 2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_a, f_d, f_up = F[i, j], F[i, j + 1], F[i, min(j+2, jmax+1) ]
+        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
@@ -279,10 +297,10 @@ def solve_VOF():  # Method described in original VOF paper
         
         # Flux bottom
         if v[i, j] > 0:
-            f_d, f_a, f_up = F[i, j-1], F[i, j], F[i, j-2]
+            f_d, f_a, f_up = F[i, j-1], F[i, j], F[i, max(0, j-2)]
         else:
             f_a, f_d, f_up = F[i, j-1], F[i, j], F[i, j+1]
-        if abs(Fgrad[i, j][0]) > 2 * abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
