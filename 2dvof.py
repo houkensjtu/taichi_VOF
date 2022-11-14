@@ -199,7 +199,6 @@ def cal_div():
 def cal_fgrad():  # 11/3 Checked, no out-of-range
     '''
     Calculate the Fgrad in internal area.
-
     '''
     #for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
     #    dfdx = 0.5 * (F[i + 1, j] - F[i - 1, j]) / dx
@@ -212,6 +211,22 @@ def cal_fgrad():  # 11/3 Checked, no out-of-range
 
 
 @ti.kernel
+def solve_p_jacobi(n:ti.i32):
+    for s in range(n):
+        for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+            assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
+            R = (-rho[i, j] / dt *
+                                ((u_star[i + 1, j] - u_star[i, j]) * dxi +
+                                 (v_star[i, j + 1] - v_star[i, j]) * dyi))
+            ae = - 1.0 * dxi ** 2 if i != imax else 0.0
+            aw = - 1.0 * dxi ** 2 if i != imin else 0.0
+            an = - 1.0 * dyi ** 2 if j != jmax else 0.0
+            a_s = - 1.0 * dyi ** 2 if j != jmin else 0.0
+            ap = -1.0 * (ae + aw + an + a_s)
+            p[i, j] = (R - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap 
+
+    
+@ti.kernel
 def update_puv():
     # TODO: Check the pressure correction equation.
     # Pressure at the surface should be specified.
@@ -222,10 +237,20 @@ def update_puv():
         p[i, j] = pv[linear_id]
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
-        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1'
+        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[i,j] = {u[i,j]}'
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
         v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
-        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1'
+        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[i,j] = {v[i,j]}'
+
+
+@ti.kernel
+def update_uv():
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
+        u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
+        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[i,j] = {u[i,j]}, p[i,j]={p[i,j]}'
+    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
+        v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
+        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[i,j] = {v[i,j]}, p[i,j]={p[i,j]}'
 
 
 @ti.kernel
@@ -335,6 +360,8 @@ while istep < istep_max:
     cal_mu_rho()
     # Solving Pressure Poisson Equation Using Projection Method
     advect()
+
+    '''
     cal_div()
     solver = ti.linalg.SparseSolver(solver_type="LU")
     solver.analyze_pattern(A)
@@ -342,10 +369,16 @@ while istep < istep_max:
     pv_np = solver.solve(R)
     pv.from_numpy(pv_np)
     isSuccess = solver.info()
-    update_puv()
+    '''
+
+    solve_p_jacobi(100)
+    update_uv()
+    # update_puv()
+    
     # solve_F()
     cal_fgrad()  # Calculate surface orientation based on current F
-    solve_VOF()    
+    solve_VOF()
+    
     set_BC()  # set boundary conditions
     if (istep % nstep) == 0:  # Output data every 100 steps
         Fnp = F.to_numpy()
