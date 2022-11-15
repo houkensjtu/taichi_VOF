@@ -50,6 +50,7 @@ Fgrad = ti.Vector.field(2, float, shape=(imax + 2, jmax + 2))
 u = ti.field(float, shape=(imax + 2, jmax + 2))
 v = ti.field(float, shape=(imax + 2, jmax + 2))
 p = ti.field(float, shape=(imax + 2, jmax + 2))
+pt = ti.field(float, shape=(imax + 2, jmax + 2))
 rho = ti.field(float, shape=(imax + 2, jmax + 2))
 mu = ti.field(float, shape=(imax + 2, jmax + 2))
 
@@ -213,6 +214,7 @@ def cal_fgrad():  # 11/3 Checked, no out-of-range
 @ti.kernel
 def solve_p_jacobi(n:ti.i32):
     for s in range(n):
+        ti.loop_config(serialize=True)
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
             R = (-rho[i, j] / dt *
@@ -223,7 +225,10 @@ def solve_p_jacobi(n:ti.i32):
             an = - 1.0 * dyi ** 2 if j != jmax else 0.0
             a_s = - 1.0 * dyi ** 2 if j != jmin else 0.0
             ap = -1.0 * (ae + aw + an + a_s)
-            p[i, j] = (R - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap 
+            pt[i, j] = (R - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap
+            assert ti.abs(pt[i, j]) < 1e6, f'>>> Pressure exploded at p[i,j] = {p[i,j]}'
+        for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+            p[i, j] = pt[i, j]
 
     
 @ti.kernel
@@ -237,20 +242,28 @@ def update_puv():
         p[i, j] = pv[linear_id]
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
-        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[i,j] = {u[i,j]}'
+        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}'
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
         v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
-        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[i,j] = {v[i,j]}'
+        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}'
 
 
 @ti.kernel
 def update_uv():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
-        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[i,j] = {u[i,j]}, p[i,j]={p[i,j]}'
+        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]}'
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
         v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
-        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[i,j] = {v[i,j]}, p[i,j]={p[i,j]}'
+        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]}'
+
+
+@ti.kernel
+def cal_vdiv()->float:
+    d = 0.0
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        d += rho[i, j] * (u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
+    return d
 
 
 @ti.kernel
@@ -360,7 +373,7 @@ while istep < istep_max:
     cal_mu_rho()
     # Solving Pressure Poisson Equation Using Projection Method
     advect()
-
+    
     '''
     cal_div()
     solver = ti.linalg.SparseSolver(solver_type="LU")
@@ -369,12 +382,11 @@ while istep < istep_max:
     pv_np = solver.solve(R)
     pv.from_numpy(pv_np)
     isSuccess = solver.info()
+    update_puv()    
     '''
-
     solve_p_jacobi(100)
     update_uv()
-    # update_puv()
-    
+
     # solve_F()
     cal_fgrad()  # Calculate surface orientation based on current F
     solve_VOF()
@@ -384,7 +396,9 @@ while istep < istep_max:
         Fnp = F.to_numpy()
         count = istep // nstep - 1
         check_mass[count] = np.sum(abs(Fnp[imin:-1, jmin:-1]))
-        print(f'>>> Number of iterations:{istep:<5d}, sum of VOF:{check_mass[count]:6.2f}')
+        div = cal_vdiv()
+        print(f'>>> Number of iterations:{istep:<5d}, sum of VOF:{check_mass[count]:6.2f}; Current velocity divergence: {div:6.2e}')
+        
         if SAVE_FIG:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
