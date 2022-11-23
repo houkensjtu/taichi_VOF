@@ -451,3 +451,13 @@ while istep < istep_max:
             plt.close()
         if SAVE_DAT:
             np.savetxt(f'output/{istep:05d}-F.csv', Fnp, delimiter=',')
+            unp = u.to_numpy()
+            vnp = v.to_numpy()
+            pnp = p.to_numpy()
+            np.savetxt(f'output/{istep:05d}-u.csv', unp, delimiter=',')
+            np.savetxt(f'output/{istep:05d}-v.csv', vnp, delimiter=',')
+            np.savetxt(f'output/{istep:05d}-p.csv', pnp, delimiter=',')
+            plt.figure(figsize=(5, 5))  # Initialize the output image
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour            
+            plt.savefig(f'output/{istep:05d}-p.png')
+            plt.close()
