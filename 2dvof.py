@@ -67,7 +67,7 @@ dxi = 1 / dx
 dyi = 1 / dy
 N = nx * ny
 L = ti.linalg.SparseMatrixBuilder(N, N, max_num_triplets=N * 6)
-
+Ati = ti.field(float, shape=(N, N))
 # The variables in the Poisson solver
 u_star = ti.field(float, shape=(imax + 2, jmax + 2))
 v_star = ti.field(float, shape=(imax + 2, jmax + 2))
@@ -97,7 +97,7 @@ def set_init_F():  # 11/3 Checked
 
 
 @ti.kernel
-def Laplace_operator(A: ti.types.sparse_matrix_builder()):
+def Laplace_operator(A: ti.types.sparse_matrix_builder(), Ati:ti.template()):
     # TODO: Check Is the coefficients of matrix A wrong?
     for i, j in ti.ndrange(res, res):
         row = i * res + j
@@ -105,22 +105,30 @@ def Laplace_operator(A: ti.types.sparse_matrix_builder()):
             center = 0.0
             if j != 0:
                 A[row, row - 1] += -1.0 * dxi**2
+                Ati[row, row - 1] += -1.0 * dxi**2                
                 center += 1.0
             if j != res - 1:
                 A[row, row + 1] += -1.0 * dxi**2
+                Ati[row, row + 1] += -1.0 * dxi**2                
                 center += 1.0
             if i != 0:
                 A[row, row - res] += -1.0 * dxi**2
+                Ati[row, row - res] += -1.0 * dxi**2                
                 center += 1.0
             if i != res - 1:
                 A[row, row + res] += -1.0 * dxi**2
+                Ati[row, row + res] += -1.0 * dxi**2                
                 center += 1.0
             A[row, row] += center * dxi**2
+            Ati[row, row] += center * dxi**2
+
     for i in ti.ndrange(res * res):
         if i == 0:
             A[0, i] += 1
+            Ati[0, i] += 1            
         else:
             A[0, i] += 0
+            Ati[0, i] += 0            
 
 
 @ti.kernel
@@ -171,20 +179,51 @@ def advect():
         v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
         u_star[i, j] = (
             u[i, j] + dt *
-            (mu[i, j] *
-             (u[i - 1, j] - 2 * u[i, j] + u[i + 1, j]) * dxi**2 + mu[i, j] *
-             (u[i, j - 1] - 2 * u[i, j] + u[i, j + 1]) * dyi**2 - u[i, j] *
-             (u[i + 1, j] - u[i - 1, j]) * 0.5 * dxi - v_here *
-             (u[i, j + 1] - u[i, j - 1]) * 0.5 * dyi + gx))
+            (mu[i, j] * (u[i - 1, j] - 2 * u[i, j] + u[i + 1, j]) * dxi**2
+             + mu[i, j] * (u[i, j - 1] - 2 * u[i, j] + u[i, j + 1]) * dyi**2
+             - u[i, j] * (u[i + 1, j] - u[i - 1, j]) * 0.5 * dxi
+             - v_here * (u[i, j + 1] - u[i, j - 1]) * 0.5 * dyi
+             + gx)
+        )
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)): # i = 1:32; j = 2:32
         u_here = 0.25 * (u[i, j - 1] + u[i, j] + u[i + 1, j - 1] + u[i + 1, j])
         v_star[i, j] = (
             v[i, j] + dt *
-            (mu[i, j] *
-             (v[i - 1, j] - 2 * v[i, j] + v[i + 1, j]) * dxi**2 + mu[i, j] *
-             (v[i, j - 1] - 2 * v[i, j] + v[i, j + 1]) * dyi**2 - u_here *
-             (v[i + 1, j] - v[i - 1, j]) * 0.5 * dxi - v[i, j] *
-             (v[i, j + 1] - v[i, j - 1]) * 0.5 * dyi + gy))
+            (mu[i, j] * (v[i - 1, j] - 2 * v[i, j] + v[i + 1, j]) * dxi**2
+             + mu[i, j] * (v[i, j - 1] - 2 * v[i, j] + v[i, j + 1]) * dyi**2
+             - u_here * (v[i + 1, j] - v[i - 1, j]) * 0.5 * dxi
+             - v[i, j] * (v[i, j + 1] - v[i, j - 1]) * 0.5 * dyi
+             + gy)
+        )
+
+
+@ti.kernel
+def advect_upwind():
+    # Upwind scheme for advection term suggested by ltt
+    # Seems almost divergent at same pace with original advect
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)): # i = 2:32; j = 1:32
+        v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
+        dudx = (u[i,j] - u[i-1,j]) * dxi if u[i,j] > 0 else (u[i+1,j]-u[i,j])*dxi
+        dudy = (u[i,j] - u[i,j-1]) * dyi if v_here > 0 else (u[i,j+1]-u[i,j])*dyi        
+        u_star[i, j] = (
+            u[i, j] + dt *
+            (mu[i, j] * (u[i - 1, j] - 2 * u[i, j] + u[i + 1, j]) * dxi**2
+             + mu[i, j] * (u[i, j - 1] - 2 * u[i, j] + u[i, j + 1]) * dyi**2
+             - u[i, j] * dudx - v_here * dudy
+             + gx)
+        )
+    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)): # i = 1:32; j = 2:32
+        u_here = 0.25 * (u[i, j - 1] + u[i, j] + u[i + 1, j - 1] + u[i + 1, j])
+        dvdx = (v[i,j] - v[i-1,j]) * dxi if u_here > 0 else (v[i+1,j] - v[i,j]) * dxi
+        dvdy = (v[i,j] - v[i,j-1]) * dyi if v[i,j] > 0 else (v[i,j+1] - v[i,j]) * dyi
+        v_star[i, j] = (
+            v[i, j] + dt *
+            (mu[i, j] * (v[i - 1, j] - 2 * v[i, j] + v[i + 1, j]) * dxi**2
+             + mu[i, j] * (v[i, j - 1] - 2 * v[i, j] + v[i, j + 1]) * dyi**2
+             - u_here * dvdx - v[i, j] * dvdy
+             + gy)
+        )
+        
 
 
 @ti.kernel
@@ -358,8 +397,10 @@ grid_staggered()
 # Set initial volume fraction
 set_init_F()
 # Create Laplace operator
-Laplace_operator(L)
+Laplace_operator(L, Ati)
 A = L.build()
+Anp = Ati.to_numpy()
+np.savetxt(f'output/A.csv', Anp, delimiter=',')
 
 istep = 0
 istep_max = 50000
@@ -372,7 +413,8 @@ while istep < istep_max:
     # Update rho, mu by F
     cal_mu_rho()
     # Solving Pressure Poisson Equation Using Projection Method
-    advect()
+    # advect()
+    advect_upwind()
     
     '''
     cal_div()
