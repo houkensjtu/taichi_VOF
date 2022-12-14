@@ -251,14 +251,18 @@ def cal_fgrad():  # 11/3 Checked, no out-of-range
 
 
 @ti.kernel
-def solve_p_jacobi(n:ti.i32):
+def solve_p_jacobi(n:ti.i32, switch:ti.i32):  # Switch = 1 => use pressure interpolation at liquid-gas interface
     for s in range(n):
         ti.loop_config(serialize=True)
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
+            # The base unit of R is = pressure (M/LT^2)
             R = (-rho[i, j] / dt *
-                                ((u_star[i + 1, j] - u_star[i, j]) * dxi +
-                                 (v_star[i, j + 1] - v_star[i, j]) * dyi))
+                 ((u_star[i + 1, j] - u_star[i, j]) * dxi +
+                  (v_star[i, j + 1] - v_star[i, j]) * dyi))
+            if switch != 0 and ti.abs(F[i, j]) < 0.999 and ti.abs(F[i, j]) > 0.001:
+                R = 0.0  # (- p[i, j] + 0.25 * (p[i+1,j]+p[i-1,j]+p[i, j - 1] + p[i, j + 1]))
+
             ae = - 1.0 * dxi ** 2 if i != imax else 0.0
             aw = - 1.0 * dxi ** 2 if i != imin else 0.0
             an = - 1.0 * dyi ** 2 if j != jmax else 0.0
@@ -269,7 +273,7 @@ def solve_p_jacobi(n:ti.i32):
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             p[i, j] = pt[i, j]
 
-    
+            
 @ti.kernel
 def update_puv():
     # TODO: Check the pressure correction equation.
@@ -291,11 +295,18 @@ def update_puv():
 def update_uv():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
+        if u[i, j] * dt > 0.25 * dx:
+            print(f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]},\
+            p[{i-1},{j}]={p[i-1,j]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
+            u_star = {u_star[i, j]}')
         assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]}'
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
         v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
+        if v[i, j] * dt > 0.25 * dy:
+            print(f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]},\
+            p[{i},{j-1}]={p[i,j-1]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
+            v_star = {v_star[i, j]}')
         assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]}'
-
 
 @ti.kernel
 def cal_vdiv()->float:
@@ -426,7 +437,7 @@ while istep < istep_max:
     isSuccess = solver.info()
     update_puv()    
     '''
-    solve_p_jacobi(100)
+    solve_p_jacobi(n=100, switch=1)
     update_uv()
 
     # solve_F()
@@ -454,10 +465,18 @@ while istep < istep_max:
             unp = u.to_numpy()
             vnp = v.to_numpy()
             pnp = p.to_numpy()
+            '''
             np.savetxt(f'output/{istep:05d}-u.csv', unp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-v.csv', vnp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-p.csv', pnp, delimiter=',')
             plt.figure(figsize=(5, 5))  # Initialize the output image
-            plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour            
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}-p.png')
             plt.close()
+            
+            plt.figure(figsize=(5, 5))  # Initialize the output image
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
+            plt.savefig(f'output/{istep:05d}-u.png')
+            plt.close()
+            '''
+
