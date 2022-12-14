@@ -473,10 +473,8 @@ while istep < istep_max:
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}-p.png')
             plt.close()
-            
             plt.figure(figsize=(5, 5))  # Initialize the output image
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}-u.png')
             plt.close()
             '''
-
