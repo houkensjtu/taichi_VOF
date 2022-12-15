@@ -3,15 +3,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 '''
-Donor-acceptor scheme now basically works
-but simulation is still unstable once density modified
-also unstable when resolution increased to > 64 x 64
-Seems reason is in update_puv; misterious divergence happened.
+Donor-acceptor scheme now basically works.
+Previous divergence was due to incorrect pressure interpolation at liquid-gas interface.
+Calculation is stable now for density ratio ~ 10:1.
+Liquid scattering still happens when density ratio > 20:1.
 '''
 ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
-SAVE_DAT = True
+SAVE_DAT = False
+SURFACE_PRESSURE_SCHEME = 0  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
+SOLA_VOF = True
 
 nx = 32  # Number of grid points in the x direction
 ny = 32  # Number of grid points in the y direction
@@ -74,6 +76,10 @@ v_star = ti.field(float, shape=(imax + 2, jmax + 2))
 R = ti.field(float, shape=((imax - imin + 1) * (imax - imin + 1)))
 pv = ti.field(float, shape=((imax - imin + 1) * (imax - imin + 1)))
 
+print(f'>>> Surface pressure scheme: {SURFACE_PRESSURE_SCHEME}')
+print(f'>>> Grid resolution: {nx} x {ny}, dt = {dt:4.2e}')
+print(f'>>> Density ratio: {rho_water / rho_air : 4.2f}')
+print(f'>>> SOLA-VOF\'s donor-acceptor scheme: {SOLA_VOF}')
 
 @ti.kernel
 def grid_staggered():  # 11/3 Checked
@@ -223,7 +229,6 @@ def advect_upwind():
              - u_here * dvdx - v[i, j] * dvdy
              + gy)
         )
-        
 
 
 @ti.kernel
@@ -251,7 +256,7 @@ def cal_fgrad():  # 11/3 Checked, no out-of-range
 
 
 @ti.kernel
-def solve_p_jacobi(n:ti.i32, switch:ti.i32):  # Switch = 1 => use pressure interpolation at liquid-gas interface
+def solve_p_jacobi(n:ti.i32):
     for s in range(n):
         ti.loop_config(serialize=True)
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
@@ -260,7 +265,7 @@ def solve_p_jacobi(n:ti.i32, switch:ti.i32):  # Switch = 1 => use pressure inter
             R = (-rho[i, j] / dt *
                  ((u_star[i + 1, j] - u_star[i, j]) * dxi +
                   (v_star[i, j + 1] - v_star[i, j]) * dyi))
-            if switch != 0 and ti.abs(F[i, j]) < 0.999 and ti.abs(F[i, j]) > 0.001:
+            if SURFACE_PRESSURE_SCHEME != 0 and ti.abs(F[i, j]) < 0.999 and ti.abs(F[i, j]) > 0.001:
                 R = 0.0  # (- p[i, j] + 0.25 * (p[i+1,j]+p[i-1,j]+p[i, j - 1] + p[i, j + 1]))
 
             ae = - 1.0 * dxi ** 2 if i != imax else 0.0
@@ -307,6 +312,7 @@ def update_uv():
             p[{i},{j-1}]={p[i,j-1]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
             v_star = {v_star[i, j]}')
         assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]}'
+
 
 @ti.kernel
 def cal_vdiv()->float:
@@ -435,14 +441,16 @@ while istep < istep_max:
     pv_np = solver.solve(R)
     pv.from_numpy(pv_np)
     isSuccess = solver.info()
-    update_puv()    
+    update_puv()
     '''
-    solve_p_jacobi(n=100, switch=1)
+    solve_p_jacobi(n=100)
     update_uv()
 
-    # solve_F()
-    cal_fgrad()  # Calculate surface orientation based on current F
-    solve_VOF()
+    if SOLA_VOF==True:  # Use SOLA-VOF's donor-acceptor scheme
+        cal_fgrad()  # Calculate surface orientation based on current F
+        solve_VOF()
+    else:
+        solve_F()  # Use ZCL's naive F advection scheme
     
     set_BC()  # set boundary conditions
     if (istep % nstep) == 0:  # Output data every 100 steps
