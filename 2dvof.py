@@ -11,7 +11,7 @@ Liquid scattering still happens when density ratio > 20:1.
 ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
-SAVE_DAT = False
+SAVE_DAT = True
 SURFACE_PRESSURE_SCHEME = 0  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
 SOLA_VOF = True
 
@@ -345,33 +345,33 @@ def solve_VOF():
         f_a, f_d, f_ad, f_up = 0.0, 0.0, 0.0, 0.0
         # Flux left
         if u[i, j] > 0:
-            f_d, f_a, f_up = F[i-1, j], F[i, j], F[ max(0,i-2) , j]
+            f_d, f_a, f_up = F[i-1, j], F[i, j], F[ ti.max(0,i-2) , j]
         else:
             f_a, f_d, f_up = F[i-1, j], F[i, j], F[i+1, j]
-        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+        if ti.abs(Fgrad[i, j][0]) > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = u[i, j] * dt
-        CF = max((1.0 - f_ad) * abs(V) - (1.0 - f_d) * dx, 0.0)
-        flux_l = min(f_ad * abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (abs(u[i,j]) + 1e-12)
+        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_l = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (ti.abs(u[i,j]) + 1e-12)
         
         # Flux right
         if u[i+1, j] > 0:
             f_d, f_a, f_up = F[i, j], F[i+1, j], F[i-1, j]
         else:
-            f_a, f_d, f_up = F[i, j], F[i+1, j], F[ min(i+2, imax+1) , j]
-        if abs(Fgrad[i, j][0]) >  abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_a, f_d, f_up = F[i, j], F[i+1, j], F[ ti.min(i+2, imax+1) , j]
+        if ti.abs(Fgrad[i, j][0]) >  ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = u[i+1, j] * dt
-        CF = max((1.0 - f_ad) * abs(V) - (1.0 - f_d) * dx, 0.0)
-        flux_r = min(f_ad * abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (abs(u[i+1, j]) + 1e-12)
+        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_r = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (ti.abs(u[i+1, j]) + 1e-12)
         if i == imax:
             flux_r = 0.0
         
@@ -379,31 +379,31 @@ def solve_VOF():
         if v[i, j + 1] > 0:
             f_d, f_a, f_up = F[i, j], F[i, j + 1], F[i, j-1]
         else:
-            f_a, f_d, f_up = F[i, j], F[i, j + 1], F[i, min(j+2, jmax+1) ]
-        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+            f_a, f_d, f_up = F[i, j], F[i, j + 1], F[i, ti.min(j+2, jmax+1) ]
+        if ti.abs(Fgrad[i, j][0])  > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = v[i, j + 1] * dt
-        CF = max((1.0 - f_ad) * abs(V) - (1.0 - f_d) * dx, 0.0)
-        flux_t = min(f_ad * abs(V) / dx + CF / dx, f_d) * (v[i,j+1]) / (abs(v[i, j+1]) + 1e-12)
+        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_t = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (v[i,j+1]) / (ti.abs(v[i, j+1]) + 1e-12)
         
         # Flux bottom
         if v[i, j] > 0:
-            f_d, f_a, f_up = F[i, j-1], F[i, j], F[i, max(0, j-2)]
+            f_d, f_a, f_up = F[i, j-1], F[i, j], F[i, ti.max(0, j-2)]
         else:
             f_a, f_d, f_up = F[i, j-1], F[i, j], F[i, j+1]
-        if abs(Fgrad[i, j][0]) > abs(Fgrad[i,j][1]):  # Surface orientation is vertical
+        if ti.abs(Fgrad[i, j][0]) > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
         V = v[i, j] * dt
-        CF = max((1.0 - f_ad) * abs(V) - (1.0 - f_d) * dx, 0.0)
-        flux_b = min(f_ad * abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (abs(v[i,j]) + 1e-12)
+        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        flux_b = ti.min(f_ad * ti.abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (ti.abs(v[i,j]) + 1e-12)
         
         F[i, j] += (flux_l - flux_r - flux_t + flux_b)
         F[i, j] = var(0, 1, F[i, j])
@@ -486,3 +486,5 @@ while istep < istep_max:
             plt.savefig(f'output/{istep:05d}-u.png')
             plt.close()
             '''
+            
+
