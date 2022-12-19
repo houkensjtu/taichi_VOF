@@ -12,7 +12,7 @@ ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
 SAVE_DAT = True
-SURFACE_PRESSURE_SCHEME = 0  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
+SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
 SOLA_VOF = True
 
 nx = 32  # Number of grid points in the x direction
@@ -39,6 +39,7 @@ y2 = 0.3
 
 # Solution parameters
 dt = 1e-3
+eps = 1e-6  # Threshold used in Fgrad calculations; if a cell's F < eps then it's empty
 
 imin = 1
 imax = imin + nx - 1
@@ -100,6 +101,7 @@ def set_init_F():  # 11/3 Checked
     for i, j in F:  # [0,33], [0,33]
         if (xm[i] >= x1) and (xm[i] <= x2) and (ym[j] >= y1) and (ym[j] <= y2):
             F[i, j] = 1.0
+            Fn[i, j] = F[i, j]
 
 
 @ti.kernel
@@ -240,21 +242,6 @@ def cal_div():
                                  (v_star[i, j + 1] - v_star[i, j]) * dyi))
 
 
-# @ti.kernel
-def cal_fgrad():  # 11/3 Checked, no out-of-range
-    '''
-    Calculate the Fgrad in internal area.
-    '''
-    #for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
-    #    dfdx = 0.5 * (F[i + 1, j] - F[i - 1, j]) / dx
-    #    dfdy = 0.5 * (F[i, j + 1] - F[i, j - 1]) / dy
-    #    Fgrad[i, j] = ti.Vector([dfdx, dfdy])
-    Fnp = F.to_numpy()
-    Fgrad_np = np.gradient(Fnp)
-    # Fgrad.from_numpy(Fgrad_np)
-    # Now Fgrad is not calculated (all 0); lead to a f_ad = f_d scheme for most cells.
-
-
 @ti.kernel
 def solve_p_jacobi(n:ti.i32):
     for s in range(n):
@@ -336,77 +323,117 @@ def solve_F():  # Method used by ZCL
 
 
 @ti.kernel
+def cal_fgrad():  # 11/3 Checked, no out-of-range
+    '''
+    Calculate the Fgrad in internal area.
+    '''
+    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+        Fx = (F[i+1, j-1] + F[i+1, j] + F[i+1, j+1]) - (F[i-1, j-1] + F[i-1, j] + F[i-1, j+1])
+        Fy = (F[i+1, j+1] + F[i, j+1] + F[i-1, j+1]) - (F[i+1, j-1] + F[i, j-1] + F[i-1, j-1])
+        dfdx = 0.5 * Fx / dx
+        dfdy = 0.5 * Fy / dy
+        Fgrad[i, j] = ti.Vector([dfdx, dfdy])
+
+
+def cal_fgrad_np():  # Calculate gradient using Numpy; not usable yet
+    Fnp = F.to_numpy()
+    Fgrad_np = np.gradient(Fnp)
+    Fgrad.from_numpy(Fgrad_np)
+
+
+@ti.kernel
 def solve_VOF():
     # TODO: Simplify the code
     # Method described in original VOF paper
-    eps = 1e-6
+    for I in ti.grouped(Fn):
+        Fn[I] = F[I]
+        
     ti.loop_config(serialize=True)
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
         f_a, f_d, f_ad, f_up = 0.0, 0.0, 0.0, 0.0
         # Flux left
         if u[i, j] > 0:
-            f_d, f_a, f_up = F[i-1, j], F[i, j], F[ ti.max(0,i-2) , j]
+            f_d, f_a, f_up = Fn[i-1, j], Fn[i, j], Fn[ti.max(0,i-2) ,j]
         else:
-            f_a, f_d, f_up = F[i-1, j], F[i, j], F[i+1, j]
+            f_a, f_d, f_up = Fn[i-1, j], Fn[i, j], Fn[i+1, j]
         if ti.abs(Fgrad[i, j][0]) > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
+        fdm = ti.max(f_d, f_up)
         V = u[i, j] * dt
-        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)
         flux_l = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (ti.abs(u[i,j]) + 1e-12)
         
         # Flux right
         if u[i+1, j] > 0:
-            f_d, f_a, f_up = F[i, j], F[i+1, j], F[i-1, j]
+            f_d, f_a, f_up = Fn[i, j], Fn[i+1, j], Fn[i-1, j]
         else:
-            f_a, f_d, f_up = F[i, j], F[i+1, j], F[ ti.min(i+2, imax+1) , j]
+            f_a, f_d, f_up = Fn[i, j], Fn[i+1, j], Fn[ti.min(i+2, imax+1) ,j]
         if ti.abs(Fgrad[i, j][0]) >  ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
+        fdm = ti.max(f_d, f_up)            
         V = u[i+1, j] * dt
-        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)        
         flux_r = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (ti.abs(u[i+1, j]) + 1e-12)
         if i == imax:
             flux_r = 0.0
         
         # Flux top
         if v[i, j + 1] > 0:
-            f_d, f_a, f_up = F[i, j], F[i, j + 1], F[i, j-1]
+            f_d, f_a, f_up = Fn[i, j], Fn[i, j + 1], Fn[i, j-1]
         else:
-            f_a, f_d, f_up = F[i, j], F[i, j + 1], F[i, ti.min(j+2, jmax+1) ]
+            f_a, f_d, f_up = Fn[i, j], Fn[i, j + 1], Fn[i, ti.min(j+2, jmax+1)]
         if ti.abs(Fgrad[i, j][0])  > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
+        fdm = ti.max(f_d, f_up)                        
         V = v[i, j + 1] * dt
-        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)        
         flux_t = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (v[i,j+1]) / (ti.abs(v[i, j+1]) + 1e-12)
         
         # Flux bottom
         if v[i, j] > 0:
-            f_d, f_a, f_up = F[i, j-1], F[i, j], F[i, ti.max(0, j-2)]
+            f_d, f_a, f_up = Fn[i, j-1], Fn[i, j], Fn[i, ti.max(0, j-2)]
         else:
-            f_a, f_d, f_up = F[i, j-1], F[i, j], F[i, j+1]
+            f_a, f_d, f_up = Fn[i, j-1], Fn[i, j], Fn[i, j+1]
         if ti.abs(Fgrad[i, j][0]) > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
             f_ad = f_a
         elif f_a < eps or f_up < eps:
             f_ad = f_a
         else:  # Surface orientation is horizontal
             f_ad = f_d
+        fdm = ti.max(f_d, f_up)                                    
         V = v[i, j] * dt
-        CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
+        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)        
         flux_b = ti.min(f_ad * ti.abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (ti.abs(v[i,j]) + 1e-12)
         
         F[i, j] += (flux_l - flux_r - flux_t + flux_b)
         F[i, j] = var(0, 1, F[i, j])
+
+
+@ti.kernel        
+def post_process_f():
+    for i, j in F:
+        Fl = F[ti.max(i-1, 0), j]
+        Fr = F[ti.min(i+1, imax+1), j]
+        Fb = F[i, ti.max(j-1, 0)]
+        Ft = F[i, ti.min(j+1, jmax+1)]
+        if F[i, j] < eps:
+            F[i, j] = 0.0
         
 
 # Calculate the coordinates of the staggered point
@@ -448,7 +475,9 @@ while istep < istep_max:
 
     if SOLA_VOF==True:  # Use SOLA-VOF's donor-acceptor scheme
         cal_fgrad()  # Calculate surface orientation based on current F
+        # cal_fgrad_np()  # Calculate surface orientation using Numpy's gradient; not usable yet
         solve_VOF()
+        post_process_f()
     else:
         solve_F()  # Use ZCL's naive F advection scheme
     
@@ -464,8 +493,8 @@ while istep < istep_max:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
             plt.figure(figsize=(5, 5))  # Initialize the output image        
-            plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
-            # plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
+            # plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}.png')
             plt.close()
         if SAVE_DAT:
@@ -473,18 +502,19 @@ while istep < istep_max:
             unp = u.to_numpy()
             vnp = v.to_numpy()
             pnp = p.to_numpy()
-            '''
             np.savetxt(f'output/{istep:05d}-u.csv', unp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-v.csv', vnp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-p.csv', pnp, delimiter=',')
-            plt.figure(figsize=(5, 5))  # Initialize the output image
-            plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
+            plt.figure(figsize=(5, 5))  # Plot the pressure field
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:05d}-p.png')
             plt.close()
-            plt.figure(figsize=(5, 5))  # Initialize the output image
-            plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
+            plt.figure(figsize=(5, 5))  # Plot the u velocity
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:05d}-u.png')
             plt.close()
-            '''
+            plt.figure(figsize=(5, 5))  # Plot the v velocity
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], vnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
+            plt.savefig(f'output/{istep:05d}-v.png')
+            plt.close()
             
-
