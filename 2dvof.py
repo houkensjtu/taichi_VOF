@@ -12,7 +12,7 @@ ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
 SAVE_DAT = True
-SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
+SURFACE_PRESSURE_SCHEME = 2  # 0 -> original divergence; 1 -> Interface interpolation; 2 -> Averaging
 SOLA_VOF = True
 
 nx = 32  # Number of grid points in the x direction
@@ -252,19 +252,33 @@ def solve_p_jacobi(n:ti.i32):
             R = (-rho[i, j] / dt *
                  ((u_star[i + 1, j] - u_star[i, j]) * dxi +
                   (v_star[i, j + 1] - v_star[i, j]) * dyi))
-            if SURFACE_PRESSURE_SCHEME != 0 and ti.abs(F[i, j]) < 0.999 and ti.abs(F[i, j]) > 0.001:
-                R = 0.0  # (- p[i, j] + 0.25 * (p[i+1,j]+p[i-1,j]+p[i, j - 1] + p[i, j + 1]))
-
             ae = - 1.0 * dxi ** 2 if i != imax else 0.0
             aw = - 1.0 * dxi ** 2 if i != imin else 0.0
             an = - 1.0 * dyi ** 2 if j != jmax else 0.0
             a_s = - 1.0 * dyi ** 2 if j != jmin else 0.0
             ap = -1.0 * (ae + aw + an + a_s)
             pt[i, j] = (R - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap
-            assert ti.abs(pt[i, j]) < 1e6, f'>>> Pressure exploded at p[i,j] = {p[i,j]}'
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             p[i, j] = pt[i, j]
-
+            
+    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+        # SOLA-VOF style; For surface cells
+        if SURFACE_PRESSURE_SCHEME == 1 and ti.abs(F[i, j]) < 0.8 and ti.abs(F[i, j]) > 0.2:
+            if ti.abs(Fgrad[i,j][0]) > ti.abs(Fgrad[i,j][1]):  # Interface is vertical
+                if Fgrad[i,j][0] > 0:  # Water on the right
+                    pt[i,j] = (1 - F[i,j]) * p[i,j] + F[i,j] * p[i+1,j]
+                elif Fgrad[i,j][0] <= 0:  # Water on the left
+                    pt[i,j] = (1 - F[i,j]) * p[i,j] + F[i,j] * p[i-1,j]
+            elif ti.abs(Fgrad[i,j][0]) <= ti.abs(Fgrad[i,j][1]):  # Interface is horizontal
+                if Fgrad[i,j][1] > 0:  # Water on the top
+                    pt[i,j] = (1 - F[i,j]) * p[i,j] + F[i,j] * p[i,j+1]
+                elif Fgrad[i,j][1] <= 0:  # Water on the bottom
+                    pt[i,j] = (1 - F[i,j]) * p[i,j] + F[i,j] * p[i,j-1]
+            p[i,j] = 0.8 * p[i,j] + 0.2 * pt[i,j]
+                       
+        # My style; averaging pressure around the cell
+        if SURFACE_PRESSURE_SCHEME ==2 and ti.abs(F[i, j]) < 0.999 and ti.abs(F[i, j]) > 0.001:
+            p[i, j] = (p[i-1,j] + p[i+1,j] + p[i,j-1] + p[i,j+1]) / 4.0
             
 @ti.kernel
 def update_puv():
@@ -286,19 +300,15 @@ def update_puv():
 @ti.kernel
 def update_uv():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
-        u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
-        if u[i, j] * dt > 0.25 * dx:
-            print(f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]},\
-            p[{i-1},{j}]={p[i-1,j]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
-            u_star = {u_star[i, j]}')
-        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]}'
+        u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi        
+        if SURFACE_PRESSURE_SCHEME == 1 and ti.abs(F[i, j]) < 0.8 and ti.abs(F[i, j]) > 0.2:        
+            u[i, j] = u_star[i, j]
+            u[i+1, j] = u_star[i+1, j]
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
-        v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
-        if v[i, j] * dt > 0.25 * dy:
-            print(f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]},\
-            p[{i},{j-1}]={p[i,j-1]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
-            v_star = {v_star[i, j]}')
-        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]}'
+        v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi        
+        if SURFACE_PRESSURE_SCHEME == 1 and ti.abs(F[i, j]) < 0.8 and ti.abs(F[i, j]) > 0.2:                
+            v[i, j] = v_star[i, j]
+            v[i, j+1] = v_star[i, j+1]            
 
 
 @ti.kernel
