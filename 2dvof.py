@@ -286,14 +286,16 @@ def update_puv():
 @ti.kernel
 def update_uv():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
-        u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
+        r = (rho[i, j] + rho[i-1, j]) * 0.5
+        u[i, j] = u_star[i, j] - dt / r * (p[i, j] - p[i - 1, j]) * dxi
         if u[i, j] * dt > 0.25 * dx:
             print(f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]},\
             p[{i-1},{j}]={p[i-1,j]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
             u_star = {u_star[i, j]}')
         assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]}'
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
-        v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
+        r = (rho[i, j] + rho[i, j-1]) * 0.5
+        v[i, j] = v_star[i, j] - dt / r * (p[i, j] - p[i, j - 1]) * dyi
         if v[i, j] * dt > 0.25 * dy:
             print(f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]},\
             p[{i},{j-1}]={p[i,j-1]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
@@ -493,8 +495,8 @@ while istep < istep_max:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
             plt.figure(figsize=(5, 5))  # Initialize the output image        
-            # plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
-            plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
+            plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
+            # plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}.png')
             plt.close()
         if SAVE_DAT:
