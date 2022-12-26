@@ -252,7 +252,19 @@ def solve_p_jacobi(n:ti.i32):
             R = (-rho[i, j] / dt *
                  ((u_star[i + 1, j] - u_star[i, j]) * dxi +
                   (v_star[i, j + 1] - v_star[i, j]) * dyi))
-            if SURFACE_PRESSURE_SCHEME != 0 and ti.abs(F[i, j]) < 0.999 and ti.abs(F[i, j]) > 0.001:
+            
+            is_surface = False
+            fc = ti.abs(F[i, j])
+            fl = ti.abs(F[i-1, j])
+            fr = ti.abs(F[i+1, j])
+            ft = ti.abs(F[i, j+1])
+            fb = ti.abs(F[i, j-1])
+            if fc < 0.999 and fc > 0.001 and (fl < 0.001 or fr < 0.001 or ft < 0.001 or fb < 0.001):
+                is_surface = True
+            else:
+                is_surface = False
+                
+            if SURFACE_PRESSURE_SCHEME != 0 and is_surface:
                 R = 0.0  # (- p[i, j] + 0.25 * (p[i+1,j]+p[i-1,j]+p[i, j - 1] + p[i, j + 1]))
 
             ae = - 1.0 * dxi ** 2 if i != imax else 0.0
