@@ -2,22 +2,17 @@ import taichi as ti
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-'''
-Donor-acceptor scheme now basically works.
-Previous divergence was due to incorrect pressure interpolation at liquid-gas interface.
-Calculation is stable now for density ratio ~ 10:1.
-Liquid scattering still happens when density ratio > 20:1.
-'''
+
 ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
-SAVE_DAT = True
+SAVE_DAT = False
 SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
 SOLA_VOF = True
 
-nx = 32  # Number of grid points in the x direction
-ny = 32  # Number of grid points in the y direction
-res = 32
+nx = 64  # Number of grid points in the x direction
+ny = 64 # Number of grid points in the y direction
+res = 64
 Lx = 1.0  # The length of the domain
 Ly = 1.0  # The width of the domain
 
@@ -38,7 +33,7 @@ y1 = 0.0
 y2 = 0.3
 
 # Solution parameters
-dt = 1e-3  # Use smaller dt for higher density ratio
+dt = 1e-4  # Use smaller dt for higher density ratio
 eps = 1e-6  # Threshold used in Fgrad calculations; if a cell's F < eps then it's empty
 
 imin = 1
@@ -56,6 +51,7 @@ p = ti.field(float, shape=(imax + 2, jmax + 2))
 pt = ti.field(float, shape=(imax + 2, jmax + 2))
 rho = ti.field(float, shape=(imax + 2, jmax + 2))
 mu = ti.field(float, shape=(imax + 2, jmax + 2))
+vdiv = ti.field(float, shape=(imax + 2, jmax + 2))
 
 x = ti.field(float, shape=imax + 3)
 y = ti.field(float, shape=jmax + 3)
@@ -98,10 +94,23 @@ def grid_staggered():  # 11/3 Checked
 @ti.kernel
 def set_init_F():  # 11/3 Checked
     # Sets the initial volume fraction
+    '''
+    # Dambreak
     for i, j in F:  # [0,33], [0,33]
         if (xm[i] >= x1) and (xm[i] <= x2) and (ym[j] >= y1) and (ym[j] <= y2):
             F[i, j] = 1.0
             Fn[i, j] = F[i, j]
+    '''
+    # Rising bubble
+    for i, j in F:
+        x = xm[i]
+        y = ym[j]
+        cx, cy = 0.5, 0.2
+        r = 0.1
+        if y < 0.9:
+            F[i, j] = 1.0
+        if ( (x - cx)**2 + (y - cy)**2 < r**2):
+            F[i, j] = 0.0
 
 
 @ti.kernel
@@ -240,12 +249,11 @@ def cal_div():
         R[linear_id] = (-rho[i, j] / dt *
                                 ((u_star[i + 1, j] - u_star[i, j]) * dxi +
                                  (v_star[i, j + 1] - v_star[i, j]) * dyi))
-
+        
 
 @ti.kernel
 def solve_p_jacobi(n:ti.i32):
     for s in range(n):
-        ti.loop_config(serialize=True)
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
             # The base unit of R is = pressure (M/LT^2)
@@ -259,16 +267,14 @@ def solve_p_jacobi(n:ti.i32):
             fr = ti.abs(F[i+1, j])
             ft = ti.abs(F[i, j+1])
             fb = ti.abs(F[i, j-1])
-
             eps = 1e-2  # This eps affects surface shape; need fine-tuning
             if fc < 1.0 - eps and fc > eps and (fl < eps or fr < eps or ft < eps or fb < eps):            
                 is_surface = True
             else:
                 is_surface = False
-                
             if SURFACE_PRESSURE_SCHEME != 0 and is_surface:
-                R = 0.0  # (- p[i, j] + 0.25 * (p[i+1,j]+p[i-1,j]+p[i, j - 1] + p[i, j + 1]))
-
+                R = 0.0
+                
             ae = - 1.0 * dxi ** 2 if i != imax else 0.0
             aw = - 1.0 * dxi ** 2 if i != imin else 0.0
             an = - 1.0 * dyi ** 2 if j != jmax else 0.0
@@ -281,20 +287,10 @@ def solve_p_jacobi(n:ti.i32):
 
             
 @ti.kernel
-def update_puv():
-    # TODO: Check the pressure correction equation.
-    # Pressure at the surface should be specified.
-    # TODO: Why u[i,j] * dt explodes when > 64x64 grid ?
-    # Seems because pressure calculation explodes
+def update_p():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
         linear_id = (i - imin) + (j - 1) * (imax + 1 - imin)
         p[i, j] = pv[linear_id]
-    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
-        u[i, j] = u_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi
-        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}'
-    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
-        v[i, j] = v_star[i, j] - dt / rho[i, j] * (p[i, j] - p[i, j - 1]) * dyi
-        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}'
 
 
 @ti.kernel
@@ -320,8 +316,9 @@ def update_uv():
 @ti.kernel
 def cal_vdiv()->float:
     d = 0.0
-    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        d += rho[i, j] * (u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
+    for i, j in ti.ndrange((imin, imax), (jmin, jmax)):
+        vdiv[i, j] = ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
+        d += ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
     return d
 
 
@@ -351,15 +348,8 @@ def cal_fgrad():  # 11/3 Checked, no out-of-range
         Fgrad[i, j] = ti.Vector([dfdx, dfdy])
 
 
-def cal_fgrad_np():  # Calculate gradient using Numpy; not usable yet
-    Fnp = F.to_numpy()
-    Fgrad_np = np.gradient(Fnp)
-    Fgrad.from_numpy(Fgrad_np)
-
-
 @ti.kernel
 def solve_VOF():
-    # TODO: Simplify the code
     # Method described in original VOF paper
     for I in ti.grouped(Fn):
         Fn[I] = F[I]
@@ -452,10 +442,9 @@ def post_process_f():
             F[i, j] = 0.0
         
 
-# Calculate the coordinates of the staggered point
 grid_staggered()
-# Set initial volume fraction
 set_init_F()
+
 # Create Laplace operator
 Laplace_operator(L, Ati)
 A = L.build()
@@ -463,18 +452,15 @@ Anp = Ati.to_numpy()
 np.savetxt(f'output/A.csv', Anp, delimiter=',')
 
 istep = 0
-istep_max = 50000
-nstep = 100
+istep_max = 500000
+nstep = 1000
 check_mass = np.zeros(istep_max // nstep)  # Check mass
 os.makedirs('output', exist_ok=True)  # Make dir for output
 
 while istep < istep_max:
-    istep += 1  # time step +1    
-    # Update rho, mu by F
+    istep += 1
     cal_mu_rho()
-    # Solving Pressure Poisson Equation Using Projection Method
-    # advect()
-    advect_upwind()
+    advect_upwind() # advect()
     
     '''
     cal_div()
@@ -484,20 +470,21 @@ while istep < istep_max:
     pv_np = solver.solve(R)
     pv.from_numpy(pv_np)
     isSuccess = solver.info()
-    update_puv()
+    update_p()
+    update_uv()
     '''
-    solve_p_jacobi(n=100)
+    solve_p_jacobi(n=30)
     update_uv()
 
     if SOLA_VOF==True:  # Use SOLA-VOF's donor-acceptor scheme
-        cal_fgrad()  # Calculate surface orientation based on current F
-        # cal_fgrad_np()  # Calculate surface orientation using Numpy's gradient; not usable yet
+        cal_fgrad()
         solve_VOF()
         post_process_f()
     else:
         solve_F()  # Use ZCL's naive F advection scheme
     
     set_BC()  # set boundary conditions
+    
     if (istep % nstep) == 0:  # Output data every 100 steps
         Fnp = F.to_numpy()
         count = istep // nstep - 1
@@ -518,6 +505,7 @@ while istep < istep_max:
             unp = u.to_numpy()
             vnp = v.to_numpy()
             pnp = p.to_numpy()
+            vdivnp = vdiv.to_numpy()
             np.savetxt(f'output/{istep:05d}-u.csv', unp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-v.csv', vnp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-p.csv', pnp, delimiter=',')
@@ -533,4 +521,9 @@ while istep < istep_max:
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:05d}-v.png')
             plt.close()
+            plt.figure(figsize=(5, 5))  # Plot the pressure field
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], vdivnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
+            plt.savefig(f'output/{istep:05d}-div.png')
+            plt.close()
+            
             
