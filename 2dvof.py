@@ -376,13 +376,15 @@ while istep < istep_max:
     istep += 1
     cal_mu_rho()
     advect_upwind()
+    set_BC()
+    
     solve_p_jacobi(n=100)
     update_uv()
-
+    set_BC()
+    
     cal_fgrad()
     solve_VOF()
     post_process_f()
-    
     set_BC()  # set boundary conditions
     
     if (istep % nstep) == 0:  # Output data every 100 steps
