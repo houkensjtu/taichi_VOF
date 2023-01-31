@@ -110,25 +110,24 @@ def set_init_F():  # 11/3 Checked
 
 @ti.kernel
 def set_BC():
-    # Set the wall as impenetrable and slip
     for i in ti.ndrange(imax + 2):
-        # bottom
+        # bottom: slip 
         u[i, jmin - 1] = u[i, jmin]
         v[i, jmin] = 0  # v[i, jmin + 1]
         F[i, jmin - 1] = F[i, jmin]
         p[i, jmin - 1] = p[i, jmin]        
-        # top
+        # top: open
         u[i, jmax + 1] = u[i, jmax]
         v[i, jmax + 1] = v[i, jmax]
         F[i, jmax + 1] = F[i, jmax]
         p[i, jmax + 1] = p[i, jmax]        
     for j in ti.ndrange(jmax + 2):
-        # left
+        # left: slip
         u[imin, j] = 0  # u[imin + 1, j]
         v[imin - 1, j] = v[imin, j]
         F[imin - 1, j] = F[imin, j]
         p[imin - 1, j] = p[imin, j]        
-        # right
+        # right: slip
         u[imax + 1, j] = 0  # u[imax, j]
         v[imax + 1, j] = v[imax, j]
         F[imax + 1, j] = F[imax, j]
@@ -148,14 +147,12 @@ def cal_mu_rho():  # 11/3 Checked + Modified
     for I in ti.grouped(rho):
         F = var(0.0, 1.0, F[I])
         rho[I] = rho_air * (1 - F) + rho_water * F
-        # mu[I] = (nu_water * rho_water + nu_air * rho_air) / rho[I] 
-        mu[I] = nu_water * F + nu_air * (1.0 - F)
+        mu[I] = nu_water * F + nu_air * (1.0 - F)  # mu is kinematic viscosity
 
 
 @ti.kernel
 def advect_upwind():
     # Upwind scheme for advection term suggested by ltt
-    # Seems almost divergent at same pace with original advect
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)): # i = 2:32; j = 1:32
         v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
         dudx = (u[i,j] - u[i-1,j]) * dxi if u[i,j] > 0 else (u[i+1,j]-u[i,j])*dxi
@@ -199,7 +196,8 @@ def solve_p_jacobi(n:ti.i32):
             R = (-rho[i, j] / dt *
                  ((u_star[i + 1, j] - u_star[i, j]) * dxi +
                   (v_star[i, j + 1] - v_star[i, j]) * dyi))
-            
+
+            # Temporary surface pressure solution; need to be modified
             is_surface = False
             fc = ti.abs(F[i, j])
             fl = ti.abs(F[i-1, j])
@@ -290,7 +288,6 @@ def solve_VOF():
             f_ad = f_d
         fdm = ti.max(f_d, f_up)
         V = u[i, j] * dt
-        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
         CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)
         flux_l = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (ti.abs(u[i,j]) + 1e-12)
         
@@ -348,7 +345,7 @@ def solve_VOF():
         flux_b = ti.min(f_ad * ti.abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (ti.abs(v[i,j]) + 1e-12)
         
         F[i, j] += (flux_l - flux_r - flux_t + flux_b)
-        F[i, j] = var(0, 1, F[i, j])
+        F[i, j] = var(0, 1.0, F[i, j])
 
 
 @ti.kernel        
@@ -360,7 +357,11 @@ def post_process_f():
         Ft = F[i, ti.min(j+1, jmax+1)]
         if F[i, j] < eps:
             F[i, j] = 0.0
-        
+        elif F[i, j] > 1.0 - eps:
+            F[i, j] = 1.0
+        elif Fl < eps or Fr < eps or Fb < eps or Ft < eps:
+            F[i, j] = F[i, j] - 1.1 * eps
+            
 
 # Start Main-loop            
 grid_staggered()
@@ -385,7 +386,7 @@ while istep < istep_max:
     cal_fgrad()
     solve_VOF()
     post_process_f()
-    set_BC()  # set boundary conditions
+    set_BC()
     
     if (istep % nstep) == 0:  # Output data every 100 steps
         Fnp = F.to_numpy()
