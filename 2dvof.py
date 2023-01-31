@@ -114,21 +114,25 @@ def set_BC():
     for i in ti.ndrange(imax + 2):
         # bottom
         u[i, jmin - 1] = u[i, jmin]
-        # v[i, jmin - 1] = v[i, jmin] # v[i, 0] = v[i, 1] both not touched in advect ?
+        v[i, jmin] = 0  # v[i, jmin + 1]
         F[i, jmin - 1] = F[i, jmin]
+        p[i, jmin - 1] = p[i, jmin]        
         # top
         u[i, jmax + 1] = u[i, jmax]
         v[i, jmax + 1] = v[i, jmax]
         F[i, jmax + 1] = F[i, jmax]
+        p[i, jmax + 1] = p[i, jmax]        
     for j in ti.ndrange(jmax + 2):
         # left
-        # u[imin - 1, j] = u[imin, j]  # u[0, j] = u[1, j] both not touched in advect ?
+        u[imin, j] = 0  # u[imin + 1, j]
         v[imin - 1, j] = v[imin, j]
         F[imin - 1, j] = F[imin, j]
+        p[imin - 1, j] = p[imin, j]        
         # right
-        u[imax + 1, j] = u[imax, j]
+        u[imax + 1, j] = 0  # u[imax, j]
         v[imax + 1, j] = v[imax, j]
         F[imax + 1, j] = F[imax, j]
+        p[imax + 1, j] = p[imax, j]        
 
 
 @ti.func
@@ -187,6 +191,7 @@ def cal_div():
 
 @ti.kernel
 def solve_p_jacobi(n:ti.i32):
+    ti.loop_config(serialize=True)
     for s in range(n):
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
@@ -243,7 +248,8 @@ def update_uv():
 @ti.kernel
 def cal_vdiv()->float:
     d = 0.0
-    for i, j in ti.ndrange((imin, imax), (jmin, jmax)):
+    ti.loop_config(serialize=True)
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
         vdiv[i, j] = ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
         d += ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
     return d
