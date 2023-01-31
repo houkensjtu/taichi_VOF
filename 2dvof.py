@@ -8,15 +8,12 @@ ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 SAVE_FIG = True
 SAVE_DAT = False
 SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
-SOLA_VOF = True
 
 nx = 64  # Number of grid points in the x direction
 ny = 64 # Number of grid points in the y direction
 res = 64
-Lx = 1.0  # The length of the domain
-Ly = 1.0  # The width of the domain
-
-# Physical parameters
+Lx = 0.1  # The length of the domain
+Ly = 0.1  # The width of the domain
 rho_water = 1.0
 rho_air = 0.5
 nu_water = 0.001  # coefficient of kinematic viscosity
@@ -65,9 +62,7 @@ dy = y[jmin + 2] - y[jmin + 1]
 dxi = 1 / dx
 dyi = 1 / dy
 N = nx * ny
-L = ti.linalg.SparseMatrixBuilder(N, N, max_num_triplets=N * 6)
-Ati = ti.field(float, shape=(N, N))
-# The variables in the Poisson solver
+
 u_star = ti.field(float, shape=(imax + 2, jmax + 2))
 v_star = ti.field(float, shape=(imax + 2, jmax + 2))
 R = ti.field(float, shape=((imax - imin + 1) * (imax - imin + 1)))
@@ -76,7 +71,7 @@ pv = ti.field(float, shape=((imax - imin + 1) * (imax - imin + 1)))
 print(f'>>> Surface pressure scheme: {SURFACE_PRESSURE_SCHEME}')
 print(f'>>> Grid resolution: {nx} x {ny}, dt = {dt:4.2e}')
 print(f'>>> Density ratio: {rho_water / rho_air : 4.2f}')
-print(f'>>> SOLA-VOF\'s donor-acceptor scheme: {SOLA_VOF}')
+
 
 @ti.kernel
 def grid_staggered():  # 11/3 Checked
@@ -105,47 +100,12 @@ def set_init_F():  # 11/3 Checked
     for i, j in F:
         x = xm[i]
         y = ym[j]
-        cx, cy = 0.5, 0.2
-        r = 0.1
-        if y < 0.9:
+        cx, cy = 0.05, 0.02
+        r = 0.01
+        if y < 0.09:
             F[i, j] = 1.0
         if ( (x - cx)**2 + (y - cy)**2 < r**2):
             F[i, j] = 0.0
-
-
-@ti.kernel
-def Laplace_operator(A: ti.types.sparse_matrix_builder(), Ati:ti.template()):
-    # TODO: Check Is the coefficients of matrix A wrong?
-    for i, j in ti.ndrange(res, res):
-        row = i * res + j
-        if row != 0:
-            center = 0.0
-            if j != 0:
-                A[row, row - 1] += -1.0 * dxi**2
-                Ati[row, row - 1] += -1.0 * dxi**2                
-                center += 1.0
-            if j != res - 1:
-                A[row, row + 1] += -1.0 * dxi**2
-                Ati[row, row + 1] += -1.0 * dxi**2                
-                center += 1.0
-            if i != 0:
-                A[row, row - res] += -1.0 * dxi**2
-                Ati[row, row - res] += -1.0 * dxi**2                
-                center += 1.0
-            if i != res - 1:
-                A[row, row + res] += -1.0 * dxi**2
-                Ati[row, row + res] += -1.0 * dxi**2                
-                center += 1.0
-            A[row, row] += center * dxi**2
-            Ati[row, row] += center * dxi**2
-
-    for i in ti.ndrange(res * res):
-        if i == 0:
-            A[0, i] += 1
-            Ati[0, i] += 1            
-        else:
-            A[0, i] += 0
-            Ati[0, i] += 0            
 
 
 @ti.kernel
@@ -186,32 +146,6 @@ def cal_mu_rho():  # 11/3 Checked + Modified
         rho[I] = rho_air * (1 - F) + rho_water * F
         # mu[I] = (nu_water * rho_water + nu_air * rho_air) / rho[I] 
         mu[I] = nu_water * F + nu_air * (1.0 - F)
-
-
-@ti.kernel
-def advect():
-    # TODO: Is this scheme better, or the original MAC scheme better?
-    # Solving Pressure Poisson Equation Using Projection Method
-    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)): # i = 2:32; j = 1:32
-        v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
-        u_star[i, j] = (
-            u[i, j] + dt *
-            (mu[i, j] * (u[i - 1, j] - 2 * u[i, j] + u[i + 1, j]) * dxi**2
-             + mu[i, j] * (u[i, j - 1] - 2 * u[i, j] + u[i, j + 1]) * dyi**2
-             - u[i, j] * (u[i + 1, j] - u[i - 1, j]) * 0.5 * dxi
-             - v_here * (u[i, j + 1] - u[i, j - 1]) * 0.5 * dyi
-             + gx)
-        )
-    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)): # i = 1:32; j = 2:32
-        u_here = 0.25 * (u[i, j - 1] + u[i, j] + u[i + 1, j - 1] + u[i + 1, j])
-        v_star[i, j] = (
-            v[i, j] + dt *
-            (mu[i, j] * (v[i - 1, j] - 2 * v[i, j] + v[i + 1, j]) * dxi**2
-             + mu[i, j] * (v[i, j - 1] - 2 * v[i, j] + v[i, j + 1]) * dyi**2
-             - u_here * (v[i + 1, j] - v[i - 1, j]) * 0.5 * dxi
-             - v[i, j] * (v[i, j + 1] - v[i, j - 1]) * 0.5 * dyi
-             + gy)
-        )
 
 
 @ti.kernel
@@ -287,13 +221,6 @@ def solve_p_jacobi(n:ti.i32):
 
             
 @ti.kernel
-def update_p():
-    for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
-        linear_id = (i - imin) + (j - 1) * (imax + 1 - imin)
-        p[i, j] = pv[linear_id]
-
-
-@ti.kernel
 def update_uv():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
         r = (rho[i, j] + rho[i-1, j]) * 0.5
@@ -320,19 +247,6 @@ def cal_vdiv()->float:
         vdiv[i, j] = ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
         d += ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
     return d
-
-
-@ti.kernel
-def solve_F():  # Method used by ZCL
-    for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
-        u_loc = 3 / 8 * (u[i, j] + u[i + 1, j]) + 1 / 16 * \
-                (u[i, j + 1] + u[i + 1, j + 1] + u[i, j - 1] + u[i + 1, j - 1])
-        v_loc = 3 / 8 * (v[i, j] + v[i, j + 1]) + 1 / 16 * \
-                (v[i - 1, j] + v[i - 1, j + 1] + v[i + 1, j] + v[i + 1, j + 1])
-        F[i, j] = (F[i, j] - dt *
-                   (u_loc * (F[i + 1, j] - F[i - 1, j]) * dxi / 2 + v_loc *
-                    (F[i, j + 1] - F[i, j - 1]) * dyi / 2))
-        F[i, j] = var(0, 1, F[i, j])
 
 
 @ti.kernel
@@ -442,14 +356,9 @@ def post_process_f():
             F[i, j] = 0.0
         
 
+# Start Main-loop            
 grid_staggered()
 set_init_F()
-
-# Create Laplace operator
-Laplace_operator(L, Ati)
-A = L.build()
-Anp = Ati.to_numpy()
-np.savetxt(f'output/A.csv', Anp, delimiter=',')
 
 istep = 0
 istep_max = 500000
@@ -460,28 +369,13 @@ os.makedirs('output', exist_ok=True)  # Make dir for output
 while istep < istep_max:
     istep += 1
     cal_mu_rho()
-    advect_upwind() # advect()
-    
-    '''
-    cal_div()
-    solver = ti.linalg.SparseSolver(solver_type="LU")
-    solver.analyze_pattern(A)
-    solver.factorize(A)
-    pv_np = solver.solve(R)
-    pv.from_numpy(pv_np)
-    isSuccess = solver.info()
-    update_p()
-    update_uv()
-    '''
-    solve_p_jacobi(n=30)
+    advect_upwind()
+    solve_p_jacobi(n=100)
     update_uv()
 
-    if SOLA_VOF==True:  # Use SOLA-VOF's donor-acceptor scheme
-        cal_fgrad()
-        solve_VOF()
-        post_process_f()
-    else:
-        solve_F()  # Use ZCL's naive F advection scheme
+    cal_fgrad()
+    solve_VOF()
+    post_process_f()
     
     set_BC()  # set boundary conditions
     
@@ -495,11 +389,12 @@ while istep < istep_max:
         if SAVE_FIG:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
+            
             plt.figure(figsize=(5, 5))  # Initialize the output image        
             plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
-            # plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)  # Plot filled-contour
             plt.savefig(f'output/{istep:05d}.png')
             plt.close()
+            
         if SAVE_DAT:
             np.savetxt(f'output/{istep:05d}-F.csv', Fnp, delimiter=',')
             unp = u.to_numpy()
@@ -509,18 +404,22 @@ while istep < istep_max:
             np.savetxt(f'output/{istep:05d}-u.csv', unp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-v.csv', vnp, delimiter=',')
             np.savetxt(f'output/{istep:05d}-p.csv', pnp, delimiter=',')
+            
             plt.figure(figsize=(5, 5))  # Plot the pressure field
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:05d}-p.png')
             plt.close()
+            
             plt.figure(figsize=(5, 5))  # Plot the u velocity
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:05d}-u.png')
             plt.close()
+            
             plt.figure(figsize=(5, 5))  # Plot the v velocity
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:05d}-v.png')
             plt.close()
+            
             plt.figure(figsize=(5, 5))  # Plot the pressure field
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vdivnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:05d}-div.png')
