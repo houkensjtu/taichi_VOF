@@ -7,7 +7,7 @@ ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
 SAVE_DAT = False
-SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation in VOF paper
+SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation
 
 nx = 64  # Number of grid points in the x direction
 ny = 64 # Number of grid points in the y direction
@@ -23,15 +23,9 @@ nu_air = 0.0005
 gx = 0
 gy = -1
 
-# The initial volume fraction of the domain
-x1 = 0.0
-x2 = 0.5
-y1 = 0.0
-y2 = 0.3
-
 # Solution parameters
 dt = 1e-4  # Use smaller dt for higher density ratio
-eps = 1e-6  # Threshold used in Fgrad calculations; if a cell's F < eps then it's empty
+eps = 1e-6  # Threshold used in vfconv and f post processings
 
 imin = 1
 imax = imin + nx - 1
@@ -61,12 +55,9 @@ dx = x[imin + 2] - x[imin + 1]
 dy = y[jmin + 2] - y[jmin + 1]
 dxi = 1 / dx
 dyi = 1 / dy
-N = nx * ny
 
 u_star = ti.field(float, shape=(imax + 2, jmax + 2))
 v_star = ti.field(float, shape=(imax + 2, jmax + 2))
-R = ti.field(float, shape=((imax - imin + 1) * (imax - imin + 1)))
-pv = ti.field(float, shape=((imax - imin + 1) * (imax - imin + 1)))
 
 print(f'>>> Surface pressure scheme: {SURFACE_PRESSURE_SCHEME}')
 print(f'>>> Grid resolution: {nx} x {ny}, dt = {dt:4.2e}')
@@ -87,10 +78,15 @@ def grid_staggered():  # 11/3 Checked
 
         
 @ti.kernel
-def set_init_F():  # 11/3 Checked
+def set_init_F():
     # Sets the initial volume fraction
     '''
     # Dambreak
+    # The initial volume fraction of the domain
+    x1 = 0.0
+    x2 = 0.5
+    y1 = 0.0
+    y2 = 0.3
     for i, j in F:  # [0,33], [0,33]
         if (xm[i] >= x1) and (xm[i] <= x2) and (ym[j] >= y1) and (ym[j] <= y2):
             F[i, j] = 1.0
@@ -178,24 +174,16 @@ def advect_upwind():
 
 
 @ti.kernel
-def cal_div():
-    for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
-        linear_id = (i - imin) + (j - jmin) * (imax + 1 - imin)
-        R[linear_id] = (-rho[i, j] / dt *
-                                ((u_star[i + 1, j] - u_star[i, j]) * dxi +
-                                 (v_star[i, j + 1] - v_star[i, j]) * dyi))
-        
-
-@ti.kernel
 def solve_p_jacobi(n:ti.i32):
     ti.loop_config(serialize=True)
     for s in range(n):
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
-            # The base unit of R is = pressure (M/LT^2)
-            R = (-rho[i, j] / dt *
+            # The base unit of rhs is (ML^-3T^-2); pressure's dimension is (ML^-1T^-2)
+            # Therefore, (ap * rhs)'s dimension is (ML^-1T^-2), which is pressure
+            rhs = - rho[i, j] / dt * \
                  ((u_star[i + 1, j] - u_star[i, j]) * dxi +
-                  (v_star[i, j + 1] - v_star[i, j]) * dyi))
+                  (v_star[i, j + 1] - v_star[i, j]) * dyi)
 
             # Temporary surface pressure solution; need to be modified
             is_surface = False
@@ -204,21 +192,23 @@ def solve_p_jacobi(n:ti.i32):
             fr = ti.abs(F[i+1, j])
             ft = ti.abs(F[i, j+1])
             fb = ti.abs(F[i, j-1])
-            eps = 1e-2  # This eps affects surface shape; need fine-tuning
-            if fc < 1.0 - eps and fc > eps and (fl < eps or fr < eps or ft < eps or fb < eps):            
+            sf_eps = 1e-2  # This eps affects surface shape; need fine-tuning
+            if fc < 1.0 - sf_eps and fc > sf_eps \
+               and (fl < sf_eps or fr < sf_eps or ft < sf_eps or fb < sf_eps):            
                 is_surface = True
             else:
                 is_surface = False
             if SURFACE_PRESSURE_SCHEME != 0 and is_surface:
-                R = 0.0
+                rhs = 0.0
                 
             ae = - 1.0 * dxi ** 2 if i != imax else 0.0
             aw = - 1.0 * dxi ** 2 if i != imin else 0.0
             an = - 1.0 * dyi ** 2 if j != jmax else 0.0
             a_s = - 1.0 * dyi ** 2 if j != jmin else 0.0
             ap = -1.0 * (ae + aw + an + a_s)
-            pt[i, j] = (R - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap
+            pt[i, j] = (rhs - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap
             assert ti.abs(pt[i, j]) < 1e6, f'>>> Pressure exploded at p[i,j] = {p[i,j]}'
+            
         for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
             p[i, j] = pt[i, j]
 
@@ -289,7 +279,7 @@ def solve_VOF():
         fdm = ti.max(f_d, f_up)
         V = u[i, j] * dt
         CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)
-        flux_l = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (ti.abs(u[i,j]) + 1e-12)
+        flux_l = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (ti.abs(u[i,j]) + 1e-16)
         
         # Flux right
         if u[i+1, j] > 0:
@@ -304,9 +294,8 @@ def solve_VOF():
             f_ad = f_d
         fdm = ti.max(f_d, f_up)            
         V = u[i+1, j] * dt
-        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
         CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)        
-        flux_r = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (ti.abs(u[i+1, j]) + 1e-12)
+        flux_r = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (ti.abs(u[i+1, j]) + 1e-16)
         if i == imax:
             flux_r = 0.0
         
@@ -323,9 +312,8 @@ def solve_VOF():
             f_ad = f_d
         fdm = ti.max(f_d, f_up)                        
         V = v[i, j + 1] * dt
-        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
         CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)        
-        flux_t = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (v[i,j+1]) / (ti.abs(v[i, j+1]) + 1e-12)
+        flux_t = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (v[i,j+1]) / (ti.abs(v[i, j+1]) + 1e-16)
         
         # Flux bottom
         if v[i, j] > 0:
@@ -340,9 +328,8 @@ def solve_VOF():
             f_ad = f_d
         fdm = ti.max(f_d, f_up)                                    
         V = v[i, j] * dt
-        # CF = ti.max((1.0 - f_ad) * ti.abs(V) - (1.0 - f_d) * dx, 0.0)
         CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)        
-        flux_b = ti.min(f_ad * ti.abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (ti.abs(v[i,j]) + 1e-12)
+        flux_b = ti.min(f_ad * ti.abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (ti.abs(v[i,j]) + 1e-16)
         
         F[i, j] += (flux_l - flux_r - flux_t + flux_b)
         F[i, j] = var(0, 1.0, F[i, j])
@@ -388,12 +375,12 @@ while istep < istep_max:
     post_process_f()
     set_BC()
     
-    if (istep % nstep) == 0:  # Output data every 100 steps
+    if (istep % nstep) == 0:  # Output data every <nstep> steps
         Fnp = F.to_numpy()
         count = istep // nstep - 1
         check_mass[count] = np.sum(abs(Fnp[imin:-1, jmin:-1]))
         div = cal_vdiv()
-        print(f'>>> Number of iterations:{istep:<5d}, sum of VOF:{check_mass[count]:6.2f}; Current velocity divergence: {div:6.2e}')
+        print(f'>>> Number of iterations:{istep:<5d}, sum of VOF:{check_mass[count]:6.2f}; velocity divergence: {div:6.2e}')
         
         if SAVE_FIG:
             xm1 = xm.to_numpy()
