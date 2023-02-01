@@ -84,9 +84,9 @@ def set_init_F():
     # Dambreak
     # The initial volume fraction of the domain
     x1 = 0.0
-    x2 = 0.5
+    x2 = Lx / 2
     y1 = 0.0
-    y2 = 0.3
+    y2 = Ly / 3
     for i, j in F:  # [0,33], [0,33]
         if (xm[i] >= x1) and (xm[i] <= x2) and (ym[j] >= y1) and (ym[j] <= y2):
             F[i, j] = 1.0
@@ -98,12 +98,14 @@ def set_init_F():
         y = ym[j]
         cx, cy = 0.05, 0.02
         r = 0.01
-        if y < 0.09:
+        if y < 0.075:
             F[i, j] = 1.0
+            Fn[i, j] = 1.0
         if ( (x - cx)**2 + (y - cy)**2 < r**2):
             F[i, j] = 0.0
+            Fn[i, j] = 0.0
 
-
+            
 @ti.kernel
 def set_BC():
     for i in ti.ndrange(imax + 2):
@@ -111,23 +113,27 @@ def set_BC():
         u[i, jmin - 1] = u[i, jmin]
         v[i, jmin] = 0  # v[i, jmin + 1]
         F[i, jmin - 1] = F[i, jmin]
-        p[i, jmin - 1] = p[i, jmin]        
+        p[i, jmin - 1] = p[i, jmin]
+        rho[i, jmin - 1] = rho[i, jmin]                
         # top: open
         u[i, jmax + 1] = u[i, jmax]
         v[i, jmax + 1] = v[i, jmax]
         F[i, jmax + 1] = F[i, jmax]
-        p[i, jmax + 1] = p[i, jmax]        
+        p[i, jmax + 1] = p[i, jmax]
+        rho[i, jmax + 1] = rho[i, jmax]                
     for j in ti.ndrange(jmax + 2):
         # left: slip
         u[imin, j] = 0  # u[imin + 1, j]
         v[imin - 1, j] = v[imin, j]
         F[imin - 1, j] = F[imin, j]
-        p[imin - 1, j] = p[imin, j]        
+        p[imin - 1, j] = p[imin, j]
+        rho[imin - 1, j] = rho[imin, j]                
         # right: slip
         u[imax + 1, j] = 0  # u[imax, j]
         v[imax + 1, j] = v[imax, j]
         F[imax + 1, j] = F[imax, j]
-        p[imax + 1, j] = p[imax, j]        
+        p[imax + 1, j] = p[imax, j]
+        rho[imax + 1, j] = rho[imax, j]                
 
 
 @ti.func
@@ -174,43 +180,40 @@ def advect_upwind():
 
 
 @ti.kernel
-def solve_p_jacobi(n:ti.i32):
-    ti.loop_config(serialize=True)
-    for s in range(n):
-        for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
-            assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
-            # The base unit of rhs is (ML^-3T^-2); pressure's dimension is (ML^-1T^-2)
-            # Therefore, (ap * rhs)'s dimension is (ML^-1T^-2), which is pressure
-            rhs = - rho[i, j] / dt * \
-                 ((u_star[i + 1, j] - u_star[i, j]) * dxi +
-                  (v_star[i, j + 1] - v_star[i, j]) * dyi)
+def solve_p_jacobi():
+    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+        assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
+        # The base unit of rhs is (ML^-3T^-2); pressure's dimension is (ML^-1T^-2)
+        # Therefore, (ap * rhs)'s dimension is (ML^-1T^-2), which is pressure
+        rhs = rho[i, j] / dt * \
+            ((u_star[i + 1, j] - u_star[i, j]) * dxi +
+             (v_star[i, j + 1] - v_star[i, j]) * dyi)
 
-            # Temporary surface pressure solution; need to be modified
-            is_surface = False
-            fc = ti.abs(F[i, j])
-            fl = ti.abs(F[i-1, j])
-            fr = ti.abs(F[i+1, j])
-            ft = ti.abs(F[i, j+1])
-            fb = ti.abs(F[i, j-1])
-            sf_eps = 1e-2  # This eps affects surface shape; need fine-tuning
-            if fc < 1.0 - sf_eps and fc > sf_eps \
-               and (fl < sf_eps or fr < sf_eps or ft < sf_eps or fb < sf_eps):            
-                is_surface = True
-            else:
-                is_surface = False
-            if SURFACE_PRESSURE_SCHEME != 0 and is_surface:
-                rhs = 0.0
-                
-            ae = - 1.0 * dxi ** 2 if i != imax else 0.0
-            aw = - 1.0 * dxi ** 2 if i != imin else 0.0
-            an = - 1.0 * dyi ** 2 if j != jmax else 0.0
-            a_s = - 1.0 * dyi ** 2 if j != jmin else 0.0
-            ap = -1.0 * (ae + aw + an + a_s)
-            pt[i, j] = (rhs - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap
-            assert ti.abs(pt[i, j]) < 1e6, f'>>> Pressure exploded at p[i,j] = {p[i,j]}'
+        # Calculate the term due to density gradient
+        drhox1 = (rho[i + 1, j - 1] + rho[i + 1, j] + rho[i + 1, j + 1]) / 3
+        drhox2 = (rho[i - 1, j - 1] + rho[i - 1, j] + rho[i - 1, j + 1]) / 3                
+        drhodx = (dt / drhox1 - dt / drhox2) / (2 * dx)
+        drhoy1 = (rho[i - 1, j + 1] + rho[i, j + 1] + rho[i + 1, j + 1]) / 3
+        drhoy2 = (rho[i - 1, j - 1] + rho[i, j - 1] + rho[i + 1, j - 1]) / 3                
+        drhody = (dt / drhoy1 - dt / drhoy2) / (2 * dy)
+        dpdx = (p[i + 1, j] - p[i - 1, j]) / (2 * dx)
+        dpdy = (p[i, j + 1] - p[i, j - 1]) / (2 * dy)
+        den_corr = (drhodx * dpdx + drhody * dpdy) * rho[i, j] / dt
+        if istep < 2:
+            pass
+        else:
+            rhs -= den_corr
             
-        for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
-            p[i, j] = pt[i, j]
+        ae = dxi ** 2 if i != imax else 0.0
+        aw = dxi ** 2 if i != imin else 0.0
+        an = dyi ** 2 if j != jmax else 0.0
+        a_s = dyi ** 2 if j != jmin else 0.0
+        ap = - 1.0 * (ae + aw + an + a_s)
+        pt[i, j] = (rhs - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap
+        assert ti.abs(pt[i, j]) < 1e6, f'>>> Pressure exploded at p[i,j] = {p[i,j]}'
+            
+    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+        p[i, j] = pt[i, j]
 
             
 @ti.kernel
@@ -262,7 +265,6 @@ def solve_VOF():
     for I in ti.grouped(Fn):
         Fn[I] = F[I]
         
-    ti.loop_config(serialize=True)
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
         f_a, f_d, f_ad, f_up = 0.0, 0.0, 0.0, 0.0
         # Flux left
@@ -365,8 +367,9 @@ while istep < istep_max:
     cal_mu_rho()
     advect_upwind()
     set_BC()
-    
-    solve_p_jacobi(n=100)
+
+    for _ in range(100):
+        solve_p_jacobi()
     update_uv()
     set_BC()
     
@@ -388,37 +391,37 @@ while istep < istep_max:
             
             plt.figure(figsize=(5, 5))  # Initialize the output image        
             plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:05d}.png')
+            plt.savefig(f'output/{istep:06d}.png')
             plt.close()
             
         if SAVE_DAT:
-            np.savetxt(f'output/{istep:05d}-F.csv', Fnp, delimiter=',')
+            np.savetxt(f'output/{istep:06d}-F.csv', Fnp, delimiter=',')
             unp = u.to_numpy()
             vnp = v.to_numpy()
             pnp = p.to_numpy()
             vdivnp = vdiv.to_numpy()
-            np.savetxt(f'output/{istep:05d}-u.csv', unp, delimiter=',')
-            np.savetxt(f'output/{istep:05d}-v.csv', vnp, delimiter=',')
-            np.savetxt(f'output/{istep:05d}-p.csv', pnp, delimiter=',')
+            np.savetxt(f'output/{istep:06d}-u.csv', unp, delimiter=',')
+            np.savetxt(f'output/{istep:06d}-v.csv', vnp, delimiter=',')
+            np.savetxt(f'output/{istep:06d}-p.csv', pnp, delimiter=',')
             
             plt.figure(figsize=(5, 5))  # Plot the pressure field
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:05d}-p.png')
+            plt.savefig(f'output/{istep:06d}-p.png')
             plt.close()
             
             plt.figure(figsize=(5, 5))  # Plot the u velocity
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:05d}-u.png')
+            plt.savefig(f'output/{istep:06d}-u.png')
             plt.close()
             
             plt.figure(figsize=(5, 5))  # Plot the v velocity
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:05d}-v.png')
+            plt.savefig(f'output/{istep:06d}-v.png')
             plt.close()
             
             plt.figure(figsize=(5, 5))  # Plot the pressure field
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vdivnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:05d}-div.png')
+            plt.savefig(f'output/{istep:06d}-div.png')
             plt.close()
             
             
