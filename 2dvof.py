@@ -3,28 +3,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
+ti.init(arch=ti.gpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
 SAVE_DAT = False
 SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation
 
-nx = 64  # Number of grid points in the x direction
-ny = 64 # Number of grid points in the y direction
-res = 64
+nx = 100  # Number of grid points in the x direction
+ny = 200 # Number of grid points in the y direction
 Lx = 0.1  # The length of the domain
-Ly = 0.1  # The width of the domain
-rho_water = 1.0
-rho_air = 0.5
+Ly = 0.2  # The width of the domain
+rho_water = 1000.00
+rho_air = 25.00
 nu_water = 0.001  # coefficient of kinematic viscosity
-nu_air = 0.0005
+nu_air = 1.5e-5
+sigma = 1e-7
 
 # Direction and magnitude of volume force
 gx = 0
-gy = -1
+gy = -10
 
 # Solution parameters
-dt = 1e-4  # Use smaller dt for higher density ratio
+dt = 1e-6  # Use smaller dt for higher density ratio
 eps = 1e-6  # Threshold used in vfconv and f post processings
 
 imin = 1
@@ -59,6 +59,22 @@ dyi = 1 / dy
 u_star = ti.field(float, shape=(imax + 2, jmax + 2))
 v_star = ti.field(float, shape=(imax + 2, jmax + 2))
 
+# Variables of interface reconstruction
+mx1 = ti.field(float, shape=(imax + 2, jmax + 2))
+my1 = ti.field(float, shape=(imax + 2, jmax + 2))
+mx2 = ti.field(float, shape=(imax + 2, jmax + 2))
+my2 = ti.field(float, shape=(imax + 2, jmax + 2))
+mx3 = ti.field(float, shape=(imax + 2, jmax + 2))
+my3 = ti.field(float, shape=(imax + 2, jmax + 2))
+mx4 = ti.field(float, shape=(imax + 2, jmax + 2))
+my4 = ti.field(float, shape=(imax + 2, jmax + 2))
+mxsum = ti.field(float, shape=(imax + 2, jmax + 2))
+mysum = ti.field(float, shape=(imax + 2, jmax + 2))
+mx = ti.field(float, shape=(imax+2, jmax+2))
+my = ti.field(float, shape=(imax+2, jmax+2))
+karpa = ti.field(float, shape=(imax + 2, jmax + 2))  # interface curvature
+magnitude = ti.field(float, shape=(imax+2, jmax+2))
+
 print(f'>>> Surface pressure scheme: {SURFACE_PRESSURE_SCHEME}')
 print(f'>>> Grid resolution: {nx} x {ny}, dt = {dt:4.2e}')
 print(f'>>> Density ratio: {rho_water / rho_air : 4.2f}')
@@ -80,13 +96,14 @@ def grid_staggered():  # 11/3 Checked
 @ti.kernel
 def set_init_F():
     # Sets the initial volume fraction
-    '''
+
     # Dambreak
     # The initial volume fraction of the domain
-    x1 = 0.0
-    x2 = Lx / 2
-    y1 = 0.0
-    y2 = Ly / 3
+    '''
+    x1 = Lx / 4
+    x2 = Lx / 4 * 3
+    y1 = Ly / 3 
+    y2 = Ly / 3 * 2
     for i, j in F:  # [0,33], [0,33]
         if (xm[i] >= x1) and (xm[i] <= x2) and (ym[j] >= y1) and (ym[j] <= y2):
             F[i, j] = 1.0
@@ -96,9 +113,10 @@ def set_init_F():
     for i, j in F:
         x = xm[i]
         y = ym[j]
-        cx, cy = 0.05, 0.02
         r = 0.01
-        if y < 0.075:
+        cx, cy = Lx / 2, 2 * r
+        liquid_height = 0.75 * Ly
+        if y < liquid_height:
             F[i, j] = 1.0
             Fn[i, j] = 1.0
         if ( (x - cx)**2 + (y - cy)**2 < r**2):
@@ -117,7 +135,7 @@ def set_BC():
         rho[i, jmin - 1] = rho[i, jmin]                
         # top: open
         u[i, jmax + 1] = u[i, jmax]
-        v[i, jmax + 1] = v[i, jmax]
+        v[i, jmax + 1] = 0  # v[i, jmax]
         F[i, jmax + 1] = F[i, jmax]
         p[i, jmax + 1] = p[i, jmax]
         rho[i, jmax + 1] = rho[i, jmax]                
@@ -158,24 +176,26 @@ def advect_upwind():
     for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)): # i = 2:32; j = 1:32
         v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
         dudx = (u[i,j] - u[i-1,j]) * dxi if u[i,j] > 0 else (u[i+1,j]-u[i,j])*dxi
-        dudy = (u[i,j] - u[i,j-1]) * dyi if v_here > 0 else (u[i,j+1]-u[i,j])*dyi        
+        dudy = (u[i,j] - u[i,j-1]) * dyi if v_here > 0 else (u[i,j+1]-u[i,j])*dyi
+        fx_karpa = - sigma * (F[i, j] - F[i - 1, j]) * (karpa[i, j] + karpa[i - 1, j]) / 2 / dx
         u_star[i, j] = (
             u[i, j] + dt *
             (mu[i, j] * (u[i - 1, j] - 2 * u[i, j] + u[i + 1, j]) * dxi**2
              + mu[i, j] * (u[i, j - 1] - 2 * u[i, j] + u[i, j + 1]) * dyi**2
              - u[i, j] * dudx - v_here * dudy
-             + gx)
+             + gx + fx_karpa * 2 / (rho[i, j] + rho[i - 1, j]))
         )
     for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)): # i = 1:32; j = 2:32
         u_here = 0.25 * (u[i, j - 1] + u[i, j] + u[i + 1, j - 1] + u[i + 1, j])
         dvdx = (v[i,j] - v[i-1,j]) * dxi if u_here > 0 else (v[i+1,j] - v[i,j]) * dxi
         dvdy = (v[i,j] - v[i,j-1]) * dyi if v[i,j] > 0 else (v[i,j+1] - v[i,j]) * dyi
+        fy_karpa = - sigma * (F[i, j] - F[i, j - 1]) * (karpa[i, j] + karpa[i, j - 1]) / 2 / dy        
         v_star[i, j] = (
             v[i, j] + dt *
             (mu[i, j] * (v[i - 1, j] - 2 * v[i, j] + v[i + 1, j]) * dxi**2
              + mu[i, j] * (v[i, j - 1] - 2 * v[i, j] + v[i, j + 1]) * dyi**2
              - u_here * dvdx - v[i, j] * dvdy
-             + gy)
+             + gy + fy_karpa * 2 / (rho[i, j] + rho[i, j - 1]))
         )
 
 
@@ -350,6 +370,45 @@ def post_process_f():
             F[i, j] = 1.0
         elif Fl < eps or Fr < eps or Fb < eps or Ft < eps:
             F[i, j] = F[i, j] - 1.1 * eps
+
+
+@ti.kernel
+def get_normal_young():
+    """
+    This performs Youngs Finite Difference, shown in pg. 99 of Tryggvason et.al, Direct Numerical Simulations of Gas-Liquid Multiphase Flows
+    It outputs the mx and my values for a given color function F
+    """
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
+        # Points in between the outermost boundaries
+        mx1[i, j] = -1 / (2 * dx) * (F[i + 1, j + 1] + F[i + 1, j] - F[i, j + 1] - F[i, j])  # (i+1/2,j+1/2)
+        my1[i, j] = -1 / (2 * dy) * (F[i + 1, j + 1] - F[i + 1, j] + F[i, j + 1] - F[i, j])
+        mx2[i, j] = -1 / (2 * dx) * (F[i + 1, j] + F[i + 1, j - 1] - F[i, j] - F[i, j - 1])  # (i+1/2,j-1/2)
+        my2[i, j] = -1 / (2 * dy) * (F[i + 1, j] - F[i + 1, j - 1] + F[i, j] - F[i, j - 1])
+        mx3[i, j] = -1 / (2 * dx) * (F[i, j] + F[i, j - 1] - F[i - 1, j] - F[i - 1, j - 1])  # (i-1/2,j-1/2)
+        my3[i, j] = -1 / (2 * dy) * (F[i, j] - F[i, j - 1] + F[i - 1, j] - F[i - 1, j - 1])
+        mx4[i, j] = -1 / (2 * dx) * (F[i, j + 1] + F[i, j] - F[i - 1, j + 1] - F[i - 1, j])  # (i-1/2,j+1/2)
+        my4[i, j] = -1 / (2 * dy) * (F[i, j + 1] - F[i, j] + F[i - 1, j + 1] - F[i - 1, j])
+        # Summing of mx and my components for normal vector
+        mxsum[i, j] = (mx1[i, j] + mx2[i, j] + mx3[i, j] + mx4[i, j]) / 4
+        mysum[i, j] = (my1[i, j] + my2[i, j] + my3[i, j] + my4[i, j]) / 4
+
+        # Normalizing the normal vector into unit vectors
+        if abs(mxsum[i, j]) < 1e-10 and abs(mysum[i, j])< 1e-10:
+            mx[i, j] = mxsum[i, j]
+            my[i, j] = mysum[i, j]
+        else:
+            magnitude[i, j] = ti.sqrt(mxsum[i, j] * mxsum[i, j] + mysum[i, j] * mysum[i, j])
+            mx[i, j] = mxsum[i, j] / magnitude[i, j]
+            my[i, j] = mysum[i, j] / magnitude[i, j]
+
+
+@ti.kernel
+def cal_karpa():
+    """
+    Calculate interface curvature
+    """
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
+        karpa[i, j] = -(1 / dx / 2 * (mx[i + 1, j] - mx[i - 1, j]) + 1 / dy / 2 * (my[i, j + 1] - my[i, j - 1]))
             
 
 # Start Main-loop            
@@ -365,6 +424,8 @@ os.makedirs('output', exist_ok=True)  # Make dir for output
 while istep < istep_max:
     istep += 1
     cal_mu_rho()
+    get_normal_young()
+    cal_karpa()
     advect_upwind()
     set_BC()
 
@@ -389,10 +450,12 @@ while istep < istep_max:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
             
-            plt.figure(figsize=(5, 5))  # Initialize the output image        
-            plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
+            plt.figure(figsize=(5, 10))  # Initialize the output image        
+            plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.75], cmap=plt.cm.jet)
             plt.savefig(f'output/{istep:06d}.png')
             plt.close()
+            # knp = karpa.to_numpy()
+            # np.savetxt(f'output/{istep:06d}-u.csv', knp, delimiter=',')
             
         if SAVE_DAT:
             np.savetxt(f'output/{istep:06d}-F.csv', Fnp, delimiter=',')
