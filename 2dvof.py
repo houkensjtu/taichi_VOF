@@ -3,28 +3,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-ti.init(arch=ti.cpu, default_fp=ti.f64, debug=True)
+ti.init(arch=ti.gpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
-SAVE_DAT = False
+SAVE_DAT = True
 SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation
 
-nx = 64  # Number of grid points in the x direction
-ny = 64 # Number of grid points in the y direction
-res = 64
+nx = 100  # Number of grid points in the x direction
+ny = 300 # Number of grid points in the y direction
+
 Lx = 0.1  # The length of the domain
-Ly = 0.1  # The width of the domain
+Ly = 0.3  # The width of the domain
 rho_water = 1.0
-rho_air = 0.5
+rho_air = 0.01
 nu_water = 0.001  # coefficient of kinematic viscosity
 nu_air = 0.0005
 
 # Direction and magnitude of volume force
 gx = 0
-gy = -1
+gy = - 5
 
 # Solution parameters
-dt = 1e-4  # Use smaller dt for higher density ratio
+dt = 1e-6  # Use smaller dt for higher density ratio
 eps = 1e-6  # Threshold used in vfconv and f post processings
 
 imin = 1
@@ -34,7 +34,14 @@ jmax = jmin + ny - 1
 
 F = ti.field(float, shape=(imax + 2, jmax + 2))
 Fn = ti.field(float, shape=(imax + 2, jmax + 2))
+Ftd = ti.field(float, shape=(imax + 2, jmax + 2))
 Fgrad = ti.Vector.field(2, float, shape=(imax + 2, jmax + 2))
+ax = ti.field(float, shape=(imax + 2, jmax + 2))
+ay = ti.field(float, shape=(imax + 2, jmax + 2))
+cx = ti.field(float, shape=(imax + 2, jmax + 2))
+cy = ti.field(float, shape=(imax + 2, jmax + 2))
+rp = ti.field(float, shape=(imax + 2, jmax + 2))
+rm = ti.field(float, shape=(imax + 2, jmax + 2))
 
 u = ti.field(float, shape=(imax + 2, jmax + 2))
 v = ti.field(float, shape=(imax + 2, jmax + 2))
@@ -61,7 +68,8 @@ v_star = ti.field(float, shape=(imax + 2, jmax + 2))
 
 print(f'>>> Surface pressure scheme: {SURFACE_PRESSURE_SCHEME}')
 print(f'>>> Grid resolution: {nx} x {ny}, dt = {dt:4.2e}')
-print(f'>>> Density ratio: {rho_water / rho_air : 4.2f}')
+print(f'>>> Density ratio: {rho_water / rho_air : 4.2f}, gravity : {gy : 4.2f}')
+print(f'>>> Viscosity ratio: {nu_water / nu_air : 4.2f}')
 
 
 @ti.kernel
@@ -75,6 +83,41 @@ def grid_staggered():  # 11/3 Checked
         xm[i] = 0.5 * (x[i] + x[i + 1])
     for j in ym:
         ym[j] = 0.5 * (y[j] + y[j + 1])
+
+
+@ti.func
+def find_area(i, j, cx, cy, r):
+    a = 0.0
+    xcoord_ct = (i - imin) * dx + dx / 2
+    ycoord_ct = (j - jmin) * dy + dy / 2
+    
+    xcoord_lu = xcoord_ct - dx / 2
+    ycoord_lu = ycoord_ct + dy / 2
+    
+    xcoord_ld = xcoord_ct - dx / 2
+    ycoord_ld = ycoord_ct - dy / 2
+    
+    xcoord_ru = xcoord_ct + dx / 2
+    ycoord_ru = ycoord_ct + dy / 2
+    
+    xcoord_rd = xcoord_ct + dx / 2
+    ycoord_rd = ycoord_ct - dy / 2
+
+    dist_ct = ti.sqrt((xcoord_ct - cx) ** 2 + (ycoord_ct - cy) ** 2)
+    dist_lu = ti.sqrt((xcoord_lu - cx) ** 2 + (ycoord_lu - cy) ** 2)
+    dist_ld = ti.sqrt((xcoord_ld - cx) ** 2 + (ycoord_ld - cy) ** 2)
+    dist_ru = ti.sqrt((xcoord_ru - cx) ** 2 + (ycoord_ru - cy) ** 2)
+    dist_rd = ti.sqrt((xcoord_rd - cx) ** 2 + (ycoord_rd - cy) ** 2)
+
+    if dist_lu > r and dist_ld > r and dist_ru > r and dist_rd > r:
+        a = 1.0
+    elif dist_lu < r and dist_ld < r and dist_ru < r and dist_rd < r:
+        a = 0.0
+    else:
+        a = 0.5 + 0.5 * (dist_ct - r) / (ti.sqrt(2.0) * dx)
+        a = var(a, 0, 1)
+        
+    return a
 
         
 @ti.kernel
@@ -98,12 +141,18 @@ def set_init_F():
         y = ym[j]
         cx, cy = 0.05, 0.02
         r = 0.01
-        if y < 0.075:
-            F[i, j] = 1.0
-            Fn[i, j] = 1.0
-        if ( (x - cx)**2 + (y - cy)**2 < r**2):
+        
+        F[i, j] = find_area(i, j, cx, cy, r)
+        Fn[i, j] = find_area(i, j, cx, cy, r)
+        
+        if y > 0.28:
             F[i, j] = 0.0
             Fn[i, j] = 0.0
+
+        # if ( (x - cx)**2 + (y - cy)**2 < r**2):
+        #     F[i, j] = 0.0
+        #     Fn[i, j] = 0.0
+
 
             
 @ti.kernel
@@ -260,7 +309,7 @@ def cal_fgrad():  # 11/3 Checked, no out-of-range
 
 
 @ti.kernel
-def solve_VOF():
+def solve_VOF_sola():
     # Method described in original VOF paper
     for I in ti.grouped(Fn):
         Fn[I] = F[I]
@@ -337,6 +386,216 @@ def solve_VOF():
         F[i, j] = var(0, 1.0, F[i, j])
 
 
+@ti.kernel
+def solve_VOF_zalesak():
+    for I in ti.grouped(Fn):
+        Fn[I] = F[I]
+        
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        fl_L = u[i, j] * dt * Fn[i - 1, j] if u[i, j] >= 0 else u[i, j] * dt * Fn[i, j]
+        fr_L = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] >= 0 else u[i + 1, j] * dt * Fn[i + 1, j]
+        ft_L = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] >= 0 else v[i, j + 1] * dt * Fn[i, j + 1]
+        fb_L = v[i, j] * dt * Fn[i, j - 1] if v[i, j] >= 0 else v[i, j] * dt * Fn[i, j]
+        Ftd[i, j] = Fn[i, j] + (fl_L - fr_L + fb_L - ft_L) * dy / (dx * dy)
+        if Ftd[i, j] > 1. or Ftd[i, j] < 0:
+            Ftd[i, j] = var(0, 1, Ftd[i, j])
+        
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        fmax = ti.max(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j], Ftd[i, j + 1], Ftd[i, j - 1])
+        fmin = ti.min(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j], Ftd[i, j + 1], Ftd[i, j - 1])
+        
+        fl_L = u[i, j] * dt * Fn[i - 1, j] if u[i, j] >= 0 else u[i, j] * dt * Fn[i, j]
+        fr_L = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] >= 0 else u[i + 1, j] * dt * Fn[i + 1, j]
+        ft_L = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] >= 0 else v[i, j + 1] * dt * Fn[i, j + 1]
+        fb_L = v[i, j] * dt * Fn[i, j - 1] if v[i, j] >= 0 else v[i, j] * dt * Fn[i, j]
+        
+        fl_H = u[i, j] * dt * Fn[i - 1, j] if u[i, j] < 0 else u[i, j] * dt * Fn[i, j]
+        fr_H = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] < 0 else u[i + 1, j] * dt * Fn[i + 1, j]
+        ft_H = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] < 0 else v[i, j + 1] * dt * Fn[i, j + 1]
+        fb_H = v[i, j] * dt * Fn[i, j - 1] if v[i, j] < 0 else v[i, j] * dt * Fn[i, j]
+
+        ax[i + 1, j] = fr_H - fr_L
+        ax[i, j] = fl_H - fl_L
+        ay[i, j + 1] = ft_H - ft_L
+        ay[i, j] = fb_H - fb_L
+
+        pp = ti.max(0, ax[i, j]) - ti.min(0, ax[i + 1, j]) + ti.max(0, ay[i, j]) - ti.min(0, ay[i, j + 1])
+        qp = (fmax - Ftd[i, j]) * dx
+        if pp > 0:
+            rp[i, j] = ti.min(1, qp / pp)
+        else:
+            rp[i, j] = 0.0
+        pm = ti.max(0, ax[i + 1, j]) - ti.min(0, ax[i, j]) + ti.max(0, ay[i, j + 1]) - ti.min(0, ay[i, j])
+        qm = (Ftd[i, j] - fmin) * dx
+        if pm > 0:
+            rm[i, j] = ti.min(1, qm / pm)
+        else:
+            rm[i, j] = 0.0
+            
+        if ax[i + 1, j] >= 0:
+            cx[i + 1, j] = ti.min(rp[i + 1, j], rm[i, j])
+        else:
+            cx[i + 1, j] = ti.min(rp[i, j], rm[i + 1, j])
+
+        if ay[i, j + 1] >= 0:
+            cy[i, j + 1] = ti.min(rp[i, j + 1], rm[i, j])
+        else:
+            cy[i, j + 1] = ti.min(rp[i, j], rm[i, j + 1])
+
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        F[i, j] = Ftd[i, j] - (ax[i + 1, j] * cx[i + 1, j] - \
+                               ax[i, j] * cx[i, j] + \
+                               ay[i, j + 1] * cy[i, j + 1] -\
+                               ay[i, j] * cy[i, j]) / (dy)
+
+
+def solve_VOF_rudman():
+    if istep % 2 == 0:
+        fct_y_sweep()
+        fct_x_sweep()
+    else:
+        fct_x_sweep()
+        fct_y_sweep()
+
+
+@ti.kernel
+def fct_x_sweep():
+    for I in ti.grouped(Fn):
+        Fn[I] = F[I]
+        
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        fl_L = u[i, j] * dt * Fn[i - 1, j] if u[i, j] >= 0 else u[i, j] * dt * Fn[i, j]
+        fr_L = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] >= 0 else u[i + 1, j] * dt * Fn[i + 1, j]
+        ft_L = 0
+        fb_L = 0
+        Ftd[i, j] = Fn[i, j] + (fl_L - fr_L + fb_L - ft_L) * dy / (dx * dy)
+        if Ftd[i, j] > 1. or Ftd[i, j] < 0:
+            Ftd[i, j] = var(0, 1, Ftd[i, j])
+        
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        # fmax = ti.max(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j], Ftd[i, j + 1], Ftd[i, j - 1])
+        fmax = ti.max(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j])  # , Ftd[i, j + 1], Ftd[i, j - 1])        
+        # fmin = ti.min(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j], Ftd[i, j + 1], Ftd[i, j - 1])
+        fmin = ti.min(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j])  # , Ftd[i, j + 1], Ftd[i, j - 1])        
+        
+        fl_L = u[i, j] * dt * Fn[i - 1, j] if u[i, j] >= 0 else u[i, j] * dt * Fn[i, j]
+        fr_L = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] >= 0 else u[i + 1, j] * dt * Fn[i + 1, j]
+        ft_L = 0
+        fb_L = 0
+        
+        fl_H = u[i, j] * dt * Fn[i - 1, j] if u[i, j] <= 0 else u[i, j] * dt * Fn[i, j]
+        fr_H = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] <= 0 else u[i + 1, j] * dt * Fn[i + 1, j]
+        ft_H = 0
+        fb_H = 0
+
+        ax[i + 1, j] = fr_H - fr_L
+        ax[i, j] = fl_H - fl_L
+        ay[i, j + 1] = 0  # ft_H - ft_L
+        ay[i, j] = 0  # fb_H - fb_L
+
+        pp = ti.max(0, ax[i, j]) - ti.min(0, ax[i + 1, j]) + ti.max(0, ay[i, j]) - ti.min(0, ay[i, j + 1])
+        qp = (fmax - Ftd[i, j]) * dx
+        if pp > 0:
+            rp[i, j] = ti.min(1, qp / pp)
+        else:
+            rp[i, j] = 0.0
+        pm = ti.max(0, ax[i + 1, j]) - ti.min(0, ax[i, j]) + ti.max(0, ay[i, j + 1]) - ti.min(0, ay[i, j])
+        qm = (Ftd[i, j] - fmin) * dx
+        if pm > 0:
+            rm[i, j] = ti.min(1, qm / pm)
+        else:
+            rm[i, j] = 0.0
+
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):            
+        if ax[i + 1, j] >= 0:
+            cx[i + 1, j] = ti.min(rp[i + 1, j], rm[i, j])
+        else:
+            cx[i + 1, j] = ti.min(rp[i, j], rm[i + 1, j])
+
+        if ay[i, j + 1] >= 0:
+            cy[i, j + 1] = ti.min(rp[i, j + 1], rm[i, j])
+        else:
+            cy[i, j + 1] = ti.min(rp[i, j], rm[i, j + 1])
+
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        F[i, j] = Ftd[i, j] - (ax[i + 1, j] * cx[i + 1, j] - \
+                               ax[i, j] * cx[i, j] + \
+                               ay[i, j + 1] * cy[i, j + 1] -\
+                               ay[i, j] * cy[i, j]) / (dy)
+        F[i, j] = var(0, 1, F[i, j])
+
+
+@ti.kernel
+def fct_y_sweep():
+
+    for I in ti.grouped(Fn):
+        Fn[I] = F[I]
+
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        fl_L = 0
+        fr_L = 0
+        ft_L = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] >= 0 else v[i, j + 1] * dt * Fn[i, j + 1]
+        fb_L = v[i, j] * dt * Fn[i, j - 1] if v[i, j] >= 0 else v[i, j] * dt * Fn[i, j]
+        Ftd[i, j] = Fn[i, j] + (fl_L - fr_L + fb_L - ft_L) * dy / (dx * dy)
+        if Ftd[i, j] > 1. or Ftd[i, j] < 0:
+            Ftd[i, j] = var(0, 1, Ftd[i, j])
+
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        # fmax = ti.max(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j], Ftd[i, j + 1], Ftd[i, j - 1])
+        fmax = ti.max(Ftd[i, j], Ftd[i, j - 1], Ftd[i, j + 1])
+        # fmin = ti.min(Ftd[i, j], Ftd[i - 1, j], Ftd[i + 1, j], Ftd[i, j + 1], Ftd[i, j - 1])
+        fmin = ti.min(Ftd[i, j], Ftd[i, j - 1], Ftd[i, j + 1]) 
+        
+        fl_L = 0
+        fr_L = 0
+        ft_L = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] >= 0 else v[i, j + 1] * dt * Fn[i, j + 1]
+        fb_L = v[i, j] * dt * Fn[i, j - 1] if v[i, j] >= 0 else v[i, j] * dt * Fn[i, j]
+        
+        fl_H = 0
+        fr_H = 0
+        ft_H = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] <= 0 else v[i, j + 1] * dt * Fn[i, j + 1]
+        fb_H = v[i, j] * dt * Fn[i, j - 1] if v[i, j] <= 0 else v[i, j] * dt * Fn[i, j]
+
+        ax[i + 1, j] = 0  # fr_H - fr_L
+        ax[i, j] = 0  # fl_H - fl_L
+        ay[i, j + 1] = ft_H - ft_L
+        ay[i, j] = fb_H - fb_L
+
+        pp = ti.max(0, ax[i, j]) - ti.min(0, ax[i + 1, j]) + ti.max(0, ay[i, j]) - ti.min(0, ay[i, j + 1])
+        qp = (fmax - Ftd[i, j]) * dx
+        if pp > 0:
+            rp[i, j] = ti.min(1, qp / pp)
+        else:
+            rp[i, j] = 0.0
+        pm = ti.max(0, ax[i + 1, j]) - ti.min(0, ax[i, j]) + ti.max(0, ay[i, j + 1]) - ti.min(0, ay[i, j])
+        qm = (Ftd[i, j] - fmin) * dx
+        if pm > 0:
+            rm[i, j] = ti.min(1, qm / pm)
+        else:
+            rm[i, j] = 0.0
+
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):        
+        if ax[i + 1, j] >= 0:
+            cx[i + 1, j] = ti.min(rp[i + 1, j], rm[i, j])
+        else:
+            cx[i + 1, j] = ti.min(rp[i, j], rm[i + 1, j])
+
+        if ay[i, j + 1] >= 0:
+            cy[i, j + 1] = ti.min(rp[i, j + 1], rm[i, j])
+        else:
+            cy[i, j + 1] = ti.min(rp[i, j], rm[i, j + 1])
+
+
+    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
+        F[i, j] = Ftd[i, j] - (ax[i + 1, j] * cx[i + 1, j] - \
+                               ax[i, j] * cx[i, j] + \
+                               ay[i, j + 1] * cy[i, j + 1] -\
+                               ay[i, j] * cy[i, j]) / (dy)
+
+        F[i, j] = var(0, 1, F[i, j])
+        
+
+        
 @ti.kernel        
 def post_process_f():
     for i, j in F:
@@ -350,6 +609,7 @@ def post_process_f():
             F[i, j] = 1.0
         elif Fl < eps or Fr < eps or Fb < eps or Ft < eps:
             F[i, j] = F[i, j] - 1.1 * eps
+        F[i, j] = var(F[i, j], 0, 1)
             
 
 # Start Main-loop            
@@ -357,7 +617,7 @@ grid_staggered()
 set_init_F()
 
 istep = 0
-istep_max = 500000
+istep_max = 5000000
 nstep = 1000
 check_mass = np.zeros(istep_max // nstep)  # Check mass
 os.makedirs('output', exist_ok=True)  # Make dir for output
@@ -374,7 +634,9 @@ while istep < istep_max:
     set_BC()
     
     cal_fgrad()
-    solve_VOF()
+    # solve_VOF_sola()
+    # solve_VOF_zalesak()
+    solve_VOF_rudman()        
     post_process_f()
     set_BC()
     
@@ -388,40 +650,48 @@ while istep < istep_max:
         if SAVE_FIG:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
-            
+            '''           
             plt.figure(figsize=(5, 5))  # Initialize the output image        
-            plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:06d}.png')
+            # plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)            
+            plt.savefig(f'output/{count:06d}.png')
             plt.close()
+            '''
+            fx, fy = Lx * 50, Ly * 50
+            plt.figure(figsize=(fx, fy))  # Initialize the output image        
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
+            plt.savefig(f'output/{count:06d}-f.png')
+            plt.close()
+ 
             
         if SAVE_DAT:
-            np.savetxt(f'output/{istep:06d}-F.csv', Fnp, delimiter=',')
+            np.savetxt(f'output/{count:06d}-F.csv', Fnp, delimiter=',')
             unp = u.to_numpy()
             vnp = v.to_numpy()
             pnp = p.to_numpy()
             vdivnp = vdiv.to_numpy()
-            np.savetxt(f'output/{istep:06d}-u.csv', unp, delimiter=',')
-            np.savetxt(f'output/{istep:06d}-v.csv', vnp, delimiter=',')
-            np.savetxt(f'output/{istep:06d}-p.csv', pnp, delimiter=',')
+            np.savetxt(f'output/{count:06d}-u.csv', unp, delimiter=',')
+            np.savetxt(f'output/{count:06d}-v.csv', vnp, delimiter=',')
+            np.savetxt(f'output/{count:06d}-p.csv', pnp, delimiter=',')
             
             plt.figure(figsize=(5, 5))  # Plot the pressure field
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:06d}-p.png')
+            plt.savefig(f'output/{count:06d}-p.png')
             plt.close()
             
             plt.figure(figsize=(5, 5))  # Plot the u velocity
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:06d}-u.png')
+            plt.savefig(f'output/{count:06d}-u.png')
             plt.close()
             
             plt.figure(figsize=(5, 5))  # Plot the v velocity
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:06d}-v.png')
+            plt.savefig(f'output/{count:06d}-v.png')
             plt.close()
             
             plt.figure(figsize=(5, 5))  # Plot the pressure field
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vdivnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
-            plt.savefig(f'output/{istep:06d}-div.png')
+            plt.savefig(f'output/{count:06d}-div.png')
             plt.close()
             
             

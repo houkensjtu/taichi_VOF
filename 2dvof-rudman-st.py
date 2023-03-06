@@ -1,22 +1,29 @@
 import taichi as ti
 import numpy as np
 import matplotlib.pyplot as plt
-from math import pi as pi
 import os
 
 ti.init(arch=ti.gpu, default_fp=ti.f64, debug=True)
 
 SAVE_FIG = True
-SAVE_DAT = True
+SAVE_DAT = False
+SURFACE_PRESSURE_SCHEME = 1  # 0 -> original divergence; 1 -> pressure interpolation
 
 nx = 100  # Number of grid points in the x direction
-ny = 100 # Number of grid points in the y direction
+ny = 100 * 3 # Number of grid points in the y direction
 
-Lx = pi  # The length of the domain
-Ly = pi  # The width of the domain
+Lx = 0.1  # The length of the domain
+Ly = 0.3  # The width of the domain
+rho_water = 1000.0
+rho_air = 10.0
+nu_water = 0.001  # coefficient of kinematic viscosity
+nu_air = 0.00015
+sigma = 0.07
 
-# Solution parameters
-dt = 1e-4  # Use smaller dt for higher density ratio
+gx = 0 # Direction and magnitude of volume force
+gy = - 10
+
+dt = 1e-6  # Use smaller dt for higher density ratio
 eps = 1e-6  # Threshold used in vfconv and f post processings
 
 imin = 1
@@ -27,7 +34,7 @@ jmax = jmin + ny - 1
 F = ti.field(float, shape=(imax + 2, jmax + 2))
 Fn = ti.field(float, shape=(imax + 2, jmax + 2))
 Ftd = ti.field(float, shape=(imax + 2, jmax + 2))
-Fgrad = ti.Vector.field(2, float, shape=(imax + 2, jmax + 2))
+
 ax = ti.field(float, shape=(imax + 2, jmax + 2))
 ay = ti.field(float, shape=(imax + 2, jmax + 2))
 cx = ti.field(float, shape=(imax + 2, jmax + 2))
@@ -35,31 +42,58 @@ cy = ti.field(float, shape=(imax + 2, jmax + 2))
 rp = ti.field(float, shape=(imax + 2, jmax + 2))
 rm = ti.field(float, shape=(imax + 2, jmax + 2))
 
-F = ti.field(float, shape=(imax + 2, jmax + 2))
 u = ti.field(float, shape=(imax + 2, jmax + 2))
 v = ti.field(float, shape=(imax + 2, jmax + 2))
+p = ti.field(float, shape=(imax + 2, jmax + 2))
+pt = ti.field(float, shape=(imax + 2, jmax + 2))
+rho = ti.field(float, shape=(imax + 2, jmax + 2))
+mu = ti.field(float, shape=(imax + 2, jmax + 2))
+
 vdiv = ti.field(float, shape=(imax + 2, jmax + 2))
+
+# Variables of interface reconstruction
+mx1 = ti.field(float, shape=(imax + 2, jmax + 2))
+my1 = ti.field(float, shape=(imax + 2, jmax + 2))
+mx2 = ti.field(float, shape=(imax + 2, jmax + 2))
+my2 = ti.field(float, shape=(imax + 2, jmax + 2))
+mx3 = ti.field(float, shape=(imax + 2, jmax + 2))
+my3 = ti.field(float, shape=(imax + 2, jmax + 2))
+mx4 = ti.field(float, shape=(imax + 2, jmax + 2))
+my4 = ti.field(float, shape=(imax + 2, jmax + 2))
+mxsum = ti.field(float, shape=(imax + 2, jmax + 2))
+mysum = ti.field(float, shape=(imax + 2, jmax + 2))
+mx = ti.field(float, shape=(imax+2, jmax+2))
+my = ti.field(float, shape=(imax+2, jmax+2))
+karpa = ti.field(float, shape=(imax + 2, jmax + 2))  # interface curvature
+magnitude = ti.field(float, shape=(imax+2, jmax+2))
 
 x = ti.field(float, shape=imax + 3)
 y = ti.field(float, shape=jmax + 3)
 x.from_numpy(np.hstack((0.0, np.linspace(0, Lx, nx + 1), Lx)))  # [0, 0, ... 1, 1]
 y.from_numpy(np.hstack((0.0, np.linspace(0, Ly, ny + 1), Ly)))  # [0, 0, ... 1, 1]
-
 xm = ti.field(float, shape=imax + 2)
 ym = ti.field(float, shape=jmax + 2)
+
 dx = x[imin + 2] - x[imin + 1]
 dy = y[jmin + 2] - y[jmin + 1]
 dxi = 1 / dx
 dyi = 1 / dy
 
-print(f'>>> VOF scheme testing')
+u_star = ti.field(float, shape=(imax + 2, jmax + 2))
+v_star = ti.field(float, shape=(imax + 2, jmax + 2))
+
+print(f'>>> Surface pressure scheme: {SURFACE_PRESSURE_SCHEME}')
 print(f'>>> Grid resolution: {nx} x {ny}, dt = {dt:4.2e}')
+print(f'>>> Density ratio: {rho_water / rho_air : 4.2f}, gravity : {gy : 4.2f}, sigma : {sigma : 4.2f}')
+print(f'>>> Viscosity ratio: {nu_water / nu_air : 4.2f}')
 
 
 @ti.kernel
 def grid_staggered():  # 11/3 Checked
     '''
     Calculate the center position of cells.
+    xm is imax + 1 size xm[0], xm[1], xm[2] ... xm[32]
+    Here the calculation is from xm[1] to xm[32]
     '''
     for i in xm:  # xm[0] = 0.0, xm[33] = 1.0
         xm[i] = 0.5 * (x[i] + x[i + 1])
@@ -105,130 +139,66 @@ def find_area(i, j, cx, cy, r):
 @ti.kernel
 def set_init_F():
     # Sets the initial volume fraction
-    for I in ti.grouped(F):
-        F[I] = 1.0
-        Fn[I] = 1.0
     '''
     # Dambreak
     # The initial volume fraction of the domain
     x1 = 0.0
-    x2 = Lx / 2
+    x2 = Lx / 3
     y1 = 0.0
-    y2 = Ly / 3
+    y2 = Ly / 2
     for i, j in F:  # [0,33], [0,33]
         if (xm[i] >= x1) and (xm[i] <= x2) and (ym[j] >= y1) and (ym[j] <= y2):
             F[i, j] = 1.0
             Fn[i, j] = F[i, j]
-
-    # Moving square
+    '''
+    # Rising bubble
     for i, j in F:
         x = xm[i]
         y = ym[j]
         cx, cy = 0.05, 0.02
-        l = 0.01
-        if ( ti.abs(x - cx) < l) and ( ti.abs(y - cy) < l):
+        r = 0.01
+        
+        F[i, j] = find_area(i, j, cx, cy, r)
+        Fn[i, j] = find_area(i, j, cx, cy, r)
+        
+        if y > 0.28:
             F[i, j] = 0.0
             Fn[i, j] = 0.0
-    
-    # Moving circle
-    for i, j in F:
-        x = xm[i]
-        y = ym[j]
-        cx, cy = Lx / 2, Ly * 3 / 4
-        r = Lx / 10
-        F[i, j] = find_area(i, j, cx, cy, r)
-        Fn[i, j] = find_area(i, j, cx, cy, r)
-            
-    '''        
-    # Slot disk
-    for i, j in F:
-        x = xm[i]
-        y = ym[j]
-        cx, cy = Lx / 2, Ly * 3 / 4
-        r = Lx / 10
-        F[i, j] = find_area(i, j, cx, cy, r)
-        Fn[i, j] = find_area(i, j, cx, cy, r)
-        sw = r / 6.0
-        sh = r * 0.8
-        if ti.abs(x - cx) < sw and ti.abs(y - cy + r / 4) < sh:
-            F[i, j] = 1.0
-            Fn[i, j] = 1.0
+
+        # if ( (x - cx)**2 + (y - cy)**2 < r**2):
+        #     F[i, j] = 0.0
+        #     Fn[i, j] = 0.0
 
 
-
-@ti.kernel
-def init_uv():
-    '''            
-    for I in ti.grouped(u):
-        u[I] = 0.01
-        v[I] = 0.01
-    '''
-    # Zalesak's slot disk
-    w = 0.3
-    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        ux = xm[i] - dx / 2
-        uy = ym[j]
-        vx = xm[i]
-        vy = ym[j] - dy / 2
-        u[i, j] = - w * (uy - Ly / 2)
-        v[i, j] = w * (vx - Lx / 2)
-    '''
-    # Kother Rider test
-    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        ux = xm[i] - dx / 2
-        uy = ym[j]
-        vx = xm[i]
-        vy = ym[j] - dy / 2
-        # u[i, j] = ti.cos(ux) * ti.sin(uy)
-        # v[i, j] = - ti.sin(vx) * ti.cos(vy)
-        u[i, j] = - ti.sin(ux) ** 2 * ti.sin(2 * uy)
-        v[i, j] = ti.sin(vy) ** 2 * ti.sin(2 * vx)        
-    '''
             
 @ti.kernel
 def set_BC():
     for i in ti.ndrange(imax + 2):
         # bottom: slip 
         u[i, jmin - 1] = u[i, jmin]
-        v[i, jmin] = v[i, jmin + 1]
+        v[i, jmin] = 0  # v[i, jmin + 1]
         F[i, jmin - 1] = F[i, jmin]
+        p[i, jmin - 1] = p[i, jmin]
+        rho[i, jmin - 1] = rho[i, jmin]                
         # top: open
         u[i, jmax + 1] = u[i, jmax]
         v[i, jmax + 1] = v[i, jmax]
         F[i, jmax + 1] = F[i, jmax]
-
+        p[i, jmax + 1] = p[i, jmax]
+        rho[i, jmax + 1] = rho[i, jmax]                
     for j in ti.ndrange(jmax + 2):
         # left: slip
-        u[imin, j] = u[imin + 1, j]
+        u[imin, j] = 0  # u[imin + 1, j]
         v[imin - 1, j] = v[imin, j]
         F[imin - 1, j] = F[imin, j]
+        p[imin - 1, j] = p[imin, j]
+        rho[imin - 1, j] = rho[imin, j]                
         # right: slip
-        u[imax + 1, j] = u[imax, j]
+        u[imax + 1, j] = 0  # u[imax, j]
         v[imax + 1, j] = v[imax, j]
         F[imax + 1, j] = F[imax, j]
-
-
-@ti.kernel
-def cal_vdiv()->float:
-    d = 0.0
-    ti.loop_config(serialize=True)
-    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        vdiv[i, j] = ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
-        d += ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
-    return d
-
-
-@ti.kernel
-def cal_fgrad():  # 11/3 Checked, no out-of-range
-    '''
-    Calculate the Fgrad in internal area.
-    '''
-    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
-        Fx = (F[i+1, j-1] + F[i+1, j] + F[i+1, j+1]) - (F[i-1, j-1] + F[i-1, j] + F[i-1, j+1])
-        Fy = (F[i+1, j+1] + F[i, j+1] + F[i-1, j+1]) - (F[i+1, j-1] + F[i, j-1] + F[i-1, j-1])
-        dfdx = 0.5 * Fx / dx
-        dfdy = 0.5 * Fy / dy
-        Fgrad[i, j] = ti.Vector([dfdx, dfdy])
+        p[imax + 1, j] = p[imax, j]
+        rho[imax + 1, j] = rho[imax, j]                
 
 
 @ti.func
@@ -239,18 +209,146 @@ def var(a, b, c):
 
 
 @ti.kernel
-def solve_VOF_upwind():
-    # FCT Method described in Rudman's 1997 paper
-    for I in ti.grouped(Fn):
-        Fn[I] = F[I]
+def cal_mu_rho():  # 11/3 Checked + Modified
+    # Calculate density rho and kinematic viscosity Mu
+    for I in ti.grouped(rho):
+        F = var(0.0, 1.0, F[I])
+        rho[I] = rho_air * (1 - F) + rho_water * F
+        mu[I] = nu_water * F + nu_air * (1.0 - F)  # mu is kinematic viscosity
 
+@ti.kernel
+def advect_upwind():
+    # Upwind scheme for advection term suggested by ltt
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)): # i = 2:32; j = 1:32
+        v_here = 0.25 * (v[i - 1, j] + v[i - 1, j + 1] + v[i, j] + v[i, j + 1])
+        dudx = (u[i,j] - u[i-1,j]) * dxi if u[i,j] > 0 else (u[i+1,j]-u[i,j])*dxi
+        dudy = (u[i,j] - u[i,j-1]) * dyi if v_here > 0 else (u[i,j+1]-u[i,j])*dyi
+        fx_karpa = - sigma * (F[i, j] - F[i - 1, j]) * (karpa[i, j] + karpa[i - 1, j]) / 2 / dx        
+        u_star[i, j] = (
+            u[i, j] + dt *
+            (mu[i, j] * (u[i - 1, j] - 2 * u[i, j] + u[i + 1, j]) * dxi**2
+             + mu[i, j] * (u[i, j - 1] - 2 * u[i, j] + u[i, j + 1]) * dyi**2
+             - u[i, j] * dudx - v_here * dudy
+             + gx + fx_karpa * 2 / (rho[i, j] + rho[i - 1, j]))
+        )
+    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)): # i = 1:32; j = 2:32
+        u_here = 0.25 * (u[i, j - 1] + u[i, j] + u[i + 1, j - 1] + u[i + 1, j])
+        dvdx = (v[i,j] - v[i-1,j]) * dxi if u_here > 0 else (v[i+1,j] - v[i,j]) * dxi
+        dvdy = (v[i,j] - v[i,j-1]) * dyi if v[i,j] > 0 else (v[i,j+1] - v[i,j]) * dyi
+        fy_karpa = - sigma * (F[i, j] - F[i, j - 1]) * (karpa[i, j] + karpa[i, j - 1]) / 2 / dy        
+        v_star[i, j] = (
+            v[i, j] + dt *
+            (mu[i, j] * (v[i - 1, j] - 2 * v[i, j] + v[i + 1, j]) * dxi**2
+             + mu[i, j] * (v[i, j - 1] - 2 * v[i, j] + v[i, j + 1]) * dyi**2
+             - u_here * dvdx - v[i, j] * dvdy
+             + gy +  fy_karpa * 2 / (rho[i, j] + rho[i, j - 1]))
+        )
+
+
+@ti.kernel
+def solve_p_jacobi():
+    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+        assert rho[i, j] <= rho_water and rho[i, j] >= rho_air
+        # The base unit of rhs is (ML^-3T^-2); pressure's dimension is (ML^-1T^-2)
+        # Therefore, (ap * rhs)'s dimension is (ML^-1T^-2), which is pressure
+        rhs = rho[i, j] / dt * \
+            ((u_star[i + 1, j] - u_star[i, j]) * dxi +
+             (v_star[i, j + 1] - v_star[i, j]) * dyi)
+
+        # Calculate the term due to density gradient
+        drhox1 = (rho[i + 1, j - 1] + rho[i + 1, j] + rho[i + 1, j + 1]) / 3
+        drhox2 = (rho[i - 1, j - 1] + rho[i - 1, j] + rho[i - 1, j + 1]) / 3                
+        drhodx = (dt / drhox1 - dt / drhox2) / (2 * dx)
+        drhoy1 = (rho[i - 1, j + 1] + rho[i, j + 1] + rho[i + 1, j + 1]) / 3
+        drhoy2 = (rho[i - 1, j - 1] + rho[i, j - 1] + rho[i + 1, j - 1]) / 3                
+        drhody = (dt / drhoy1 - dt / drhoy2) / (2 * dy)
+        dpdx = (p[i + 1, j] - p[i - 1, j]) / (2 * dx)
+        dpdy = (p[i, j + 1] - p[i, j - 1]) / (2 * dy)
+        den_corr = (drhodx * dpdx + drhody * dpdy) * rho[i, j] / dt
+        if istep < 2:
+            pass
+        else:
+            rhs -= den_corr
+            
+        ae = dxi ** 2 if i != imax else 0.0
+        aw = dxi ** 2 if i != imin else 0.0
+        an = dyi ** 2 if j != jmax else 0.0
+        a_s = dyi ** 2 if j != jmin else 0.0
+        ap = - 1.0 * (ae + aw + an + a_s)
+        pt[i, j] = (rhs - ae * p[i+1,j] - aw * p[i-1,j] - an * p[i,j+1] - a_s * p[i,j-1]) / ap
+        assert ti.abs(pt[i, j]) < 1e8, f'>>> Pressure exploded at p[{i},{j}] = {p[i,j]}'
+            
+    for i, j in ti.ndrange((imin, imax+1), (jmin, jmax+1)):
+        p[i, j] = pt[i, j]
+
+            
+@ti.kernel
+def update_uv():
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin + 1, imax + 1)):
+        r = (rho[i, j] + rho[i-1, j]) * 0.5
+        u[i, j] = u_star[i, j] - dt / r * (p[i, j] - p[i - 1, j]) * dxi
+        if u[i, j] * dt > 0.25 * dx:
+            print(f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]},\
+            p[{i-1},{j}]={p[i-1,j]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
+            u_star = {u_star[i, j]}')
+        assert u[i, j] * dt < 0.25 * dx, f'U velocity courant number > 1, u[{i},{j}] = {u[i,j]}, p[{i},{j}]={p[i,j]}'
+    for j, i in ti.ndrange((jmin + 1, jmax + 1), (imin, imax + 1)):
+        r = (rho[i, j] + rho[i, j-1]) * 0.5
+        v[i, j] = v_star[i, j] - dt / r * (p[i, j] - p[i, j - 1]) * dyi
+        if v[i, j] * dt > 0.25 * dy:
+            print(f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]},\
+            p[{i},{j-1}]={p[i,j-1]}, delt = {- dt / rho[i, j] * (p[i, j] - p[i - 1, j]) * dxi},\
+            v_star = {v_star[i, j]}')
+        assert v[i, j] * dt < 0.25 * dy, f'V velocity courant number > 1, v[{i},{j}] = {v[i,j]}, p[{i},{j}]={p[i,j]}'
+
+
+@ti.kernel
+def cal_vdiv()->float:
+    d = 0.0
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        fl = u[i, j] * dt * Fn[i - 1, j] if u[i, j] > 0 else u[i, j] * dt * Fn[i, j]
-        fr = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] > 0 else u[i + 1, j] * dt * Fn[i + 1, j]
-        ft = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] > 0 else v[i, j + 1] * dt * Fn[i, j + 1]
-        fb = v[i, j] * dt * Fn[i, j - 1] if v[i, j] > 0 else v[i, j] * dt * Fn[i, j]
-        F[i, j] += (fl - fr + fb - ft) * dy / (dx * dy)
+        vdiv[i, j] = ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
+        d += ti.abs(u[i+1,j] - u[i,j] + v[i,j+1] - v[i,j])
+    return d
 
+
+@ti.kernel
+def cal_karpa():
+    """
+    Calculate interface curvature
+    """
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
+        karpa[i, j] = -(1 / dx / 2 * (mx[i + 1, j] - mx[i - 1, j]) + 1 / dy / 2 * (my[i, j + 1] - my[i, j - 1]))
+
+
+@ti.kernel
+def get_normal_young():
+    """
+    This performs Youngs Finite Difference, shown in pg. 99 of Tryggvason et.al, Direct Numerical Simulations of Gas-Liquid Multiphase Flows
+    It outputs the mx and my values for a given color function F
+    """
+    for j, i in ti.ndrange((jmin, jmax + 1), (imin, imax + 1)):
+        # Points in between the outermost boundaries
+        mx1[i, j] = -1 / (2 * dx) * (F[i + 1, j + 1] + F[i + 1, j] - F[i, j + 1] - F[i, j])  # (i+1/2,j+1/2)
+        my1[i, j] = -1 / (2 * dy) * (F[i + 1, j + 1] - F[i + 1, j] + F[i, j + 1] - F[i, j])
+        mx2[i, j] = -1 / (2 * dx) * (F[i + 1, j] + F[i + 1, j - 1] - F[i, j] - F[i, j - 1])  # (i+1/2,j-1/2)
+        my2[i, j] = -1 / (2 * dy) * (F[i + 1, j] - F[i + 1, j - 1] + F[i, j] - F[i, j - 1])
+        mx3[i, j] = -1 / (2 * dx) * (F[i, j] + F[i, j - 1] - F[i - 1, j] - F[i - 1, j - 1])  # (i-1/2,j-1/2)
+        my3[i, j] = -1 / (2 * dy) * (F[i, j] - F[i, j - 1] + F[i - 1, j] - F[i - 1, j - 1])
+        mx4[i, j] = -1 / (2 * dx) * (F[i, j + 1] + F[i, j] - F[i - 1, j + 1] - F[i - 1, j])  # (i-1/2,j+1/2)
+        my4[i, j] = -1 / (2 * dy) * (F[i, j + 1] - F[i, j] + F[i - 1, j + 1] - F[i - 1, j])
+        # Summing of mx and my components for normal vector
+        mxsum[i, j] = (mx1[i, j] + mx2[i, j] + mx3[i, j] + mx4[i, j]) / 4
+        mysum[i, j] = (my1[i, j] + my2[i, j] + my3[i, j] + my4[i, j]) / 4
+
+        # Normalizing the normal vector into unit vectors
+        if abs(mxsum[i, j]) < 1e-10 and abs(mysum[i, j])< 1e-10:
+            mx[i, j] = mxsum[i, j]
+            my[i, j] = mysum[i, j]
+        else:
+            magnitude[i, j] = ti.sqrt(mxsum[i, j] * mxsum[i, j] + mysum[i, j] * mysum[i, j])
+            mx[i, j] = mxsum[i, j] / magnitude[i, j]
+            my[i, j] = mysum[i, j] / magnitude[i, j]
+        
 
 @ti.kernel
 def solve_VOF_zalesak():
@@ -316,9 +414,6 @@ def solve_VOF_zalesak():
 
 
 def solve_VOF_rudman():
-    '''
-    fct_x_sweep()
-    '''
     if istep % 2 == 0:
         fct_y_sweep()
         fct_x_sweep()
@@ -331,16 +426,15 @@ def solve_VOF_rudman():
 def fct_x_sweep():
     for I in ti.grouped(Fn):
         Fn[I] = F[I]
+        
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
         dv = dx * dy - dt * dy * (u[i + 1, j] - u[i, j])
+        # dv = dx * dy
         fl_L = u[i, j] * dt * Fn[i - 1, j] if u[i, j] >= 0 else u[i, j] * dt * Fn[i, j]
         fr_L = u[i + 1, j] * dt * Fn[i, j] if u[i + 1, j] >= 0 else u[i + 1, j] * dt * Fn[i + 1, j]
         ft_L = 0
         fb_L = 0
-        Ftd[i, j] = Fn[i, j] + (fl_L - fr_L + fb_L - ft_L) * dy / (dx * dy)
-        Ftd[i, j] = Ftd[i, j] * dx * dy / dv
-        # if u[i, j] != u[i + 1, j]:
-        #     print('>>> u[i, j] = ', u[i, j], 'u[i + 1, j] = ', u[i + 1, j], ' fl_L = ', fl_L, 'fr_L = ', fr_L, 'at ', i, j)
+        Ftd[i, j] = (Fn[i, j] + (fl_L - fr_L + fb_L - ft_L) * dy / (dx * dy)) * dx * dy / dv
         if Ftd[i, j] > 1. or Ftd[i, j] < 0:
             Ftd[i, j] = var(0, 1, Ftd[i, j])
         
@@ -405,13 +499,13 @@ def fct_y_sweep():
         Fn[I] = F[I]
 
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        dv = dx * dy - dt * dx * (v[i, j + 1] - v[i, j])        
+        dv = dx * dy - dt * dx * (v[i, j + 1] - v[i, j])
+        # dv = dx * dy
         fl_L = 0
         fr_L = 0
         ft_L = v[i, j + 1] * dt * Fn[i, j] if v[i, j + 1] >= 0 else v[i, j + 1] * dt * Fn[i, j + 1]
         fb_L = v[i, j] * dt * Fn[i, j - 1] if v[i, j] >= 0 else v[i, j] * dt * Fn[i, j]
-        Ftd[i, j] = Fn[i, j] + (fl_L - fr_L + fb_L - ft_L) * dy / (dx * dy)
-        Ftd[i, j] = Ftd[i, j] * dx * dy / dv
+        Ftd[i, j] = (Fn[i, j] + (fl_L - fr_L + fb_L - ft_L) * dy / (dx * dy)) * dx * dy / dv
         if Ftd[i, j] > 1. or Ftd[i, j] < 0:
             Ftd[i, j] = var(0, 1, Ftd[i, j])
 
@@ -462,92 +556,16 @@ def fct_y_sweep():
 
 
     for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        dv = dx * dy - dt * dx * (v[i, j + 1] - v[i, j])                
+        dv = dx * dy - dt * dx * (v[i, j + 1] - v[i, j])        
         F[i, j] = Ftd[i, j] - ((ax[i + 1, j] * cx[i + 1, j] - \
                                ax[i, j] * cx[i, j] + \
                                ay[i, j + 1] * cy[i, j + 1] -\
                                ay[i, j] * cy[i, j]) / (dy)) * dx * dy / dv
+
         F[i, j] = var(0, 1, F[i, j])
+        
 
         
-@ti.kernel
-def solve_VOF_sola():
-    # Method described in original VOF paper
-    for I in ti.grouped(Fn):
-        Fn[I] = F[I]
-        
-    for i, j in ti.ndrange((imin, imax + 1), (jmin, jmax + 1)):
-        f_a, f_d, f_ad, f_up = 0.0, 0.0, 0.0, 0.0
-        # Flux left
-        if u[i, j] > 0:
-            f_d, f_a, f_up = Fn[i-1, j], Fn[i, j], Fn[ti.max(0,i-2) ,j]
-        else:
-            f_a, f_d, f_up = Fn[i-1, j], Fn[i, j], Fn[i+1, j]
-        if ti.abs(Fgrad[i, j][0]) > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_a
-        elif f_a < eps or f_up < eps:
-            f_ad = f_a
-        else:  # Surface orientation is horizontal
-            f_ad = f_d
-        fdm = ti.max(f_d, f_up)
-        V = u[i, j] * dt
-        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)
-        flux_l = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i,j]) / (ti.abs(u[i,j]) + 1e-16)
-        
-        # Flux right
-        if u[i+1, j] > 0:
-            f_d, f_a, f_up = Fn[i, j], Fn[i+1, j], Fn[i-1, j]
-        else:
-            f_a, f_d, f_up = Fn[i, j], Fn[i+1, j], Fn[ti.min(i+2, imax+1) ,j]
-        if ti.abs(Fgrad[i, j][0]) >  ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_a
-        elif f_a < eps or f_up < eps:
-            f_ad = f_a
-        else:  # Surface orientation is horizontal
-            f_ad = f_d
-        fdm = ti.max(f_d, f_up)            
-        V = u[i+1, j] * dt
-        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)
-        flux_r = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (u[i+1, j]) / (ti.abs(u[i+1, j]) + 1e-16)
-        if i == imax:
-            flux_r = 0.0
-        
-        # Flux top
-        if v[i, j + 1] > 0:
-            f_d, f_a, f_up = Fn[i, j], Fn[i, j + 1], Fn[i, j-1]
-        else:
-            f_a, f_d, f_up = Fn[i, j], Fn[i, j + 1], Fn[i, ti.min(j+2, jmax+1)]
-        if ti.abs(Fgrad[i, j][0])  > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_a
-        elif f_a < eps or f_up < eps:
-            f_ad = f_a
-        else:  # Surface orientation is horizontal
-            f_ad = f_d
-        fdm = ti.max(f_d, f_up)                        
-        V = v[i, j + 1] * dt
-        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)
-        flux_t = ti.min(f_ad * ti.abs(V) / dx + CF / dx, f_d) * (v[i,j+1]) / (ti.abs(v[i, j+1]) + 1e-16)
-        
-        # Flux bottom
-        if v[i, j] > 0:
-            f_d, f_a, f_up = Fn[i, j-1], Fn[i, j], Fn[i, ti.max(0, j-2)]
-        else:
-            f_a, f_d, f_up = Fn[i, j-1], Fn[i, j], Fn[i, j+1]
-        if ti.abs(Fgrad[i, j][0]) > ti.abs(Fgrad[i,j][1]):  # Surface orientation is vertical
-            f_ad = f_a
-        elif f_a < eps or f_up < eps:
-            f_ad = f_a
-        else:  # Surface orientation is horizontal
-            f_ad = f_d
-        fdm = ti.max(f_d, f_up)                                    
-        V = v[i, j] * dt
-        CF = ti.max((fdm - f_ad) * ti.abs(V) - (fdm - f_d) * dx, 0.0)
-        flux_b = ti.min(f_ad * ti.abs(V) / dx + CF /dx, f_d) * (v[i,j]) / (ti.abs(v[i,j]) + 1e-16)
-        
-        F[i, j] += (flux_l - flux_r - flux_t + flux_b)
-        F[i, j] = var(0, 1.0, F[i, j])
-
-
 @ti.kernel        
 def post_process_f():
     for i, j in F:
@@ -561,6 +579,7 @@ def post_process_f():
             F[i, j] = 1.0
         # elif Fl < eps or Fr < eps or Fb < eps or Ft < eps:
         #     F[i, j] = F[i, j] - 1.1 * eps
+        F[i, j] = var(F[i, j], 0, 1)
             
 
 # Start Main-loop            
@@ -568,23 +587,27 @@ grid_staggered()
 set_init_F()
 
 istep = 0
-istep_max = 500000
+istep_max = 5000000
 nstep = 1000
 check_mass = np.zeros(istep_max // nstep)  # Check mass
 os.makedirs('output', exist_ok=True)  # Make dir for output
 
 while istep < istep_max:
     istep += 1
-    init_uv()
+    cal_mu_rho()
+    cal_karpa()
+    get_normal_young()
+    advect_upwind()
     set_BC()
-    # cal_fgrad()
-    # solve_VOF_sola()  # Original Donor-Acceptor
+
+    for _ in range(100):
+        solve_p_jacobi()
+    update_uv()
+    set_BC()
     
-    # solve_VOF_upwind()  # Upwind scheme
-    
-    solve_VOF_rudman()
-    
+    # solve_VOF_sola()
     # solve_VOF_zalesak()
+    solve_VOF_rudman()        
     post_process_f()
     set_BC()
     
@@ -598,21 +621,42 @@ while istep < istep_max:
         if SAVE_FIG:
             xm1 = xm.to_numpy()
             ym1 = ym.to_numpy()
-            
+            '''           
             plt.figure(figsize=(5, 5))  # Initialize the output image        
             # plt.contour(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, [0.5], cmap=plt.cm.jet)
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)            
             plt.savefig(f'output/{count:06d}.png')
             plt.close()
+            '''
+            fx, fy = Lx * 50, Ly * 50
+            plt.figure(figsize=(fx, fy))  # Initialize the output image        
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], Fnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
+            plt.savefig(f'output/{count:06d}-f.png')
+            plt.close()
+ 
             
         if SAVE_DAT:
             np.savetxt(f'output/{count:06d}-F.csv', Fnp, delimiter=',')
+            knp = karpa.to_numpy()
+            np.savetxt(f'output/{count:06d}-k.csv', knp, delimiter=',')
+            plt.figure(figsize=(5, 5))  # Plot the pressure field
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], knp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
+            plt.savefig(f'output/{count:06d}-k.png')
+            plt.close()
+            '''
             unp = u.to_numpy()
             vnp = v.to_numpy()
+            pnp = p.to_numpy()
             vdivnp = vdiv.to_numpy()
+
             np.savetxt(f'output/{count:06d}-u.csv', unp, delimiter=',')
             np.savetxt(f'output/{count:06d}-v.csv', vnp, delimiter=',')
-            np.savetxt(f'output/{count:06d}-vdiv.csv', vdivnp, delimiter=',')
+            np.savetxt(f'output/{count:06d}-p.csv', pnp, delimiter=',')
+
+            plt.figure(figsize=(5, 5))  # Plot the pressure field
+            plt.contourf(xm1[imin:-1], ym1[jmin:-1], pnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
+            plt.savefig(f'output/{count:06d}-p.png')
+            plt.close()
             
             plt.figure(figsize=(5, 5))  # Plot the u velocity
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], unp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
@@ -624,9 +668,9 @@ while istep < istep_max:
             plt.savefig(f'output/{count:06d}-v.png')
             plt.close()
             
-            plt.figure(figsize=(5, 5))  # Plot the velocity divergence field
+            plt.figure(figsize=(5, 5))  # Plot the pressure field
             plt.contourf(xm1[imin:-1], ym1[jmin:-1], vdivnp[imin:-1, jmin:-1].T, cmap=plt.cm.jet)
             plt.savefig(f'output/{count:06d}-div.png')
             plt.close()
-            
+            '''
             
