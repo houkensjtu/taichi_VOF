@@ -8,8 +8,8 @@ ti.init(arch=ti.gpu, default_fp=ti.f32)
 
 SAVE_FIG = False
 
-nx = 200  # Number of grid points in the x direction
-ny = 200  # Number of grid points in the y direction
+nx = 100  # Number of grid points in the x direction
+ny = 100  # Number of grid points in the y direction
 
 Lx = 0.1  # The length of the domain
 Ly = 0.1  # The width of the domain
@@ -22,7 +22,7 @@ sigma = 0.07
 gx = 0 # Gravity
 gy = -9.8
 
-dt = 5e-6  # Use smaller dt for higher density ratio
+dt = 1e-5  # Use smaller dt for higher density ratio
 eps = 1e-6  # Threshold used in vfconv and f post processings
 
 # Mesh information
@@ -32,8 +32,10 @@ jmin = 1
 jmax = jmin + ny - 1
 x = ti.field(float, shape=imax + 3)
 y = ti.field(float, shape=jmax + 3)
-x.from_numpy(np.hstack((0.0, np.linspace(0, Lx, nx + 1), Lx)))  # [0, 0, ... 1, 1]
-y.from_numpy(np.hstack((0.0, np.linspace(0, Ly, ny + 1), Ly)))  # [0, 0, ... 1, 1]
+xnp = np.hstack((0.0, np.linspace(0, Lx, nx + 1), Lx)).astype(np.float32)  # [0, 0, ... 1, 1]
+x.from_numpy(xnp)
+ynp = np.hstack((0.0, np.linspace(0, Ly, ny + 1), Ly)).astype(np.float32)  # [0, 0, ... 1, 1]
+y.from_numpy(ynp)
 xm = ti.field(float, shape=imax + 2)
 ym = ti.field(float, shape=jmax + 2)
 dx = x[imin + 2] - x[imin + 1]
@@ -138,7 +140,7 @@ def find_area(i, j, cx, cy, r):
 @ti.kernel
 def set_init_F():
     # Sets the initial volume fraction
-    '''
+
     # Dambreak
     # The initial volume fraction of the domain
     x1 = 0.0
@@ -159,7 +161,7 @@ def set_init_F():
         
         F[i, j] = find_area(i, j, cx, cy, r)
         Fn[i, j] = find_area(i, j, cx, cy, r)
-
+    '''
 
             
 @ti.kernel
@@ -495,7 +497,7 @@ def get_vof_field():
 grid_staggered()
 set_init_F()
 istep = 0
-nstep = 100
+nstep = 10
 os.makedirs('output', exist_ok=True)  # Make dir for output
 gui = ti.GUI('VOF Solver', resolution)
 

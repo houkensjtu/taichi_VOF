@@ -4,10 +4,10 @@ import matplotlib.pyplot as plt
 from math import pi as pi
 import os
 
-ti.init(arch=ti.gpu, default_fp=ti.f64, debug=True)
+ti.init(arch=ti.cpu, default_fp=ti.f32, debug=True)
 
 SAVE_FIG = True
-SAVE_DAT = True
+SAVE_DAT = False
 
 nx = 100  # Number of grid points in the x direction
 ny = 100 # Number of grid points in the y direction
@@ -580,9 +580,9 @@ while istep < istep_max:
     # cal_fgrad()
     # solve_VOF_sola()  # Original Donor-Acceptor
     
-    # solve_VOF_upwind()  # Upwind scheme
+    solve_VOF_upwind()  # Upwind scheme
     
-    solve_VOF_rudman()
+    # solve_VOF_rudman()
     
     # solve_VOF_zalesak()
     post_process_f()
